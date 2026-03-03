@@ -1,0 +1,12 @@
+# Ignore large training artifacts
+/tmp/
+/outputs/
+/src/lerobot/scripts/outputs/
+
+# Runtime and build artifacts
+/logs/
+/build/
+
+# Python cache
+__pycache__/
+*.pyc
