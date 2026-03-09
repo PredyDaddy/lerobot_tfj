@@ -70,6 +70,31 @@ lerobot-train \
 2. **Training duration**: Expect a few hours for 100k training steps on a single GPU
 3. **Batch size**: Start with batch size 8 and adjust based on your GPU memory
 
+### Distilling an Existing ACT Teacher
+
+ACT now supports offline teacher-student distillation during the standard training loop. The student keeps the
+usual behavior cloning loss and adds an auxiliary L1 loss against a frozen teacher action chunk.
+
+```bash
+lerobot-train \
+  --dataset.repo_id=/path/to/your_dataset \
+  --policy.type=act \
+  --policy.kd=true \
+  --policy.teacher_policy_path=/path/to/teacher/output_or_checkpoint \
+  --policy.kd_weight=1.0 \
+  --policy.kd_overlap_steps=50 \
+  --policy.kd_temporal_decay=0.02 \
+  --policy.chunk_size=50 \
+  --policy.n_action_steps=50 \
+  --output_dir=outputs/train/act_student
+```
+
+Notes:
+
+- `teacher_policy_path` may point to a `pretrained_model` directory, a checkpoint directory, or an ACT output directory containing `checkpoints/last`.
+- Distillation only supervises the overlapping action prefix between teacher and student, so you can safely train a shorter-horizon student from a longer-horizon teacher.
+- Teacher and student must agree on observation keys, input shapes, and action dimensions.
+
 ### Train using Google Colab
 
 If your local computer doesn't have a powerful GPU, you can utilize Google Colab to train your model by following the [ACT training notebook](./notebooks#training-act).

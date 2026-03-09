@@ -33,7 +33,11 @@ from lerobot.envs.factory import make_env, make_env_config
 from lerobot.envs.utils import preprocess_observation
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.act.configuration_act import ACTConfig
-from lerobot.policies.act.modeling_act import ACTTemporalEnsembler
+from lerobot.policies.act.modeling_act import (
+    ACTPolicy,
+    ACTTemporalEnsembler,
+    _resolve_teacher_pretrained_path,
+)
 from lerobot.policies.factory import (
     get_policy_class,
     make_policy,
@@ -452,3 +456,97 @@ def test_act_temporal_ensembler():
         assert torch.all(offline_avg <= einops.reduce(seq_slice, "b s 1 -> b 1", "max"))
         # Selected atol=1e-4 keeping in mind actions in [-1, 1] and excepting 0.01% error.
         torch.testing.assert_close(online_avg, offline_avg, rtol=1e-4, atol=1e-4)
+
+
+def test_act_kd_requires_teacher_path():
+    input_features = {
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(2,)),
+        f"{OBS_IMAGES}.top": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 32, 32)),
+    }
+    output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(2,))}
+
+    with pytest.raises(ValueError, match="teacher_policy_path"):
+        ACTConfig(
+            input_features=input_features,
+            output_features=output_features,
+            pretrained_backbone_weights=None,
+            kd=True,
+        )
+
+
+def test_resolve_teacher_pretrained_path_from_output_dir(tmp_path):
+    teacher_output_dir = tmp_path / "teacher_run"
+    pretrained_dir = teacher_output_dir / "checkpoints" / "000123" / "pretrained_model"
+    pretrained_dir.mkdir(parents=True)
+    (pretrained_dir / "config.json").write_text("{}")
+    (pretrained_dir / "model.safetensors").write_bytes(b"")
+    (pretrained_dir / "train_config.json").write_text("{}")
+    (teacher_output_dir / "checkpoints" / "last").symlink_to(teacher_output_dir / "checkpoints" / "000123")
+
+    assert _resolve_teacher_pretrained_path(teacher_output_dir) == pretrained_dir
+    assert _resolve_teacher_pretrained_path(teacher_output_dir / "checkpoints" / "000123") == pretrained_dir
+    assert _resolve_teacher_pretrained_path(pretrained_dir / "train_config.json") == pretrained_dir
+
+
+def test_act_forward_adds_kd_loss(monkeypatch):
+    input_features = {
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(2,)),
+        f"{OBS_IMAGES}.top": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 32, 32)),
+    }
+    output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(2,))}
+    config = ACTConfig(
+        input_features=input_features,
+        output_features=output_features,
+        pretrained_backbone_weights=None,
+        use_vae=False,
+        chunk_size=4,
+        n_action_steps=4,
+        dim_model=32,
+        n_heads=4,
+        dim_feedforward=64,
+        n_encoder_layers=1,
+        n_decoder_layers=1,
+        kd=True,
+        teacher_policy_path=Path("/tmp/fake-teacher"),
+        kd_weight=2.0,
+        kd_overlap_steps=3,
+    )
+    policy = ACTPolicy(config)
+
+    student_actions = torch.tensor(
+        [[[0.0, 0.0], [1.0, 1.0], [3.0, 3.0], [4.0, 4.0]]], dtype=torch.float32
+    )
+    teacher_actions = torch.tensor(
+        [[[1.0, 1.0], [2.0, 2.0], [5.0, 5.0], [7.0, 7.0]]], dtype=torch.float32
+    )
+    batch = {
+        OBS_STATE: torch.zeros(1, 2),
+        f"{OBS_IMAGES}.top": torch.zeros(1, 3, 32, 32),
+        ACTION: torch.tensor([[[0.0, 0.0], [2.0, 2.0], [6.0, 6.0], [8.0, 8.0]]], dtype=torch.float32),
+        "action_is_pad": torch.tensor([[False, False, True, True]]),
+    }
+
+    def fake_student_forward(_batch):
+        return student_actions, (None, None)
+
+    class FakeTeacherPolicy:
+        def to(self, _device):
+            return self
+
+        def predict_action_chunk(self, _batch):
+            return teacher_actions
+
+    monkeypatch.setattr(policy.model, "forward", fake_student_forward)
+    monkeypatch.setattr(policy, "_get_teacher_policy", lambda: FakeTeacherPolicy())
+
+    loss, loss_dict = policy.forward(batch)
+
+    action_mask = (~batch["action_is_pad"]).unsqueeze(-1)
+    expected_l1 = (torch.abs(batch[ACTION] - student_actions) * action_mask).mean()
+    expected_kd = (torch.abs(student_actions[:, :3] - teacher_actions[:, :3]) * action_mask[:, :3]).mean()
+    expected_loss = expected_l1 + config.kd_weight * expected_kd
+
+    torch.testing.assert_close(loss, expected_loss)
+    assert loss_dict["l1_loss"] == pytest.approx(expected_l1.item())
+    assert loss_dict["kd_l1_loss"] == pytest.approx(expected_kd.item())
+    assert loss_dict["kd_overlap_steps"] == pytest.approx(3.0)

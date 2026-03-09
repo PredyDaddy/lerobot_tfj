@@ -3,6 +3,17 @@
 /outputs/
 /src/lerobot/scripts/outputs/
 
+# Model artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
+*.trt
+*.tflite
+*.pb
+
 # Runtime and build artifacts
 /logs/
 /build/

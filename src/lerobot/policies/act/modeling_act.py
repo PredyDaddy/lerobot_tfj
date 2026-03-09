@@ -23,6 +23,7 @@ import math
 from collections import deque
 from collections.abc import Callable
 from itertools import chain
+from pathlib import Path
 
 import einops
 import numpy as np
@@ -36,6 +37,69 @@ from torchvision.ops.misc import FrozenBatchNorm2d
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+
+
+def _get_batch_device(batch: dict[str, Tensor]) -> torch.device:
+    if OBS_STATE in batch:
+        return batch[OBS_STATE].device
+    if OBS_ENV_STATE in batch:
+        return batch[OBS_ENV_STATE].device
+    if OBS_IMAGES in batch and batch[OBS_IMAGES]:
+        return batch[OBS_IMAGES][0].device
+    raise KeyError(
+        f"Could not infer batch device. Expected one of `{OBS_STATE}`, `{OBS_ENV_STATE}`, or `{OBS_IMAGES}`."
+    )
+
+
+def _is_pretrained_policy_dir(path: Path) -> bool:
+    return (path / "config.json").is_file() and (path / "model.safetensors").is_file()
+
+
+def _resolve_teacher_pretrained_path(teacher_path: str | Path) -> Path:
+    teacher_path = Path(teacher_path).expanduser()
+    if not teacher_path.exists():
+        raise FileNotFoundError(f"Teacher path does not exist: {teacher_path}")
+
+    if teacher_path.is_file():
+        if teacher_path.name in {"config.json", "train_config.json"} and _is_pretrained_policy_dir(
+            teacher_path.parent
+        ):
+            return teacher_path.parent
+        raise FileNotFoundError(
+            "Teacher path must point to `pretrained_model`, a checkpoint directory, an output directory, "
+            f"or `config.json`/`train_config.json`. Got file: {teacher_path}"
+        )
+
+    if _is_pretrained_policy_dir(teacher_path):
+        return teacher_path
+
+    pretrained_dir = teacher_path / "pretrained_model"
+    if _is_pretrained_policy_dir(pretrained_dir):
+        return pretrained_dir
+
+    checkpoints_dir = teacher_path / "checkpoints"
+    if checkpoints_dir.is_dir():
+        last_checkpoint = checkpoints_dir / "last"
+        if last_checkpoint.exists():
+            resolved_last = last_checkpoint.resolve()
+            if _is_pretrained_policy_dir(resolved_last):
+                return resolved_last
+            resolved_last_pretrained = resolved_last / "pretrained_model"
+            if _is_pretrained_policy_dir(resolved_last_pretrained):
+                return resolved_last_pretrained
+
+        numeric_checkpoints = sorted(
+            [candidate for candidate in checkpoints_dir.iterdir() if candidate.is_dir() and candidate.name.isdigit()]
+        )
+        for checkpoint_dir in reversed(numeric_checkpoints):
+            checkpoint_pretrained_dir = checkpoint_dir / "pretrained_model"
+            if _is_pretrained_policy_dir(checkpoint_pretrained_dir):
+                return checkpoint_pretrained_dir
+
+    raise FileNotFoundError(
+        "Could not resolve a teacher pretrained model from path "
+        f"`{teacher_path}`. Expected a directory containing `config.json` and `model.safetensors`."
+    )
 
 
 class ACTPolicy(PreTrainedPolicy):
@@ -61,6 +125,7 @@ class ACTPolicy(PreTrainedPolicy):
         self.config = config
 
         self.model = ACT(config)
+        self.__dict__["_teacher_policy"] = None
 
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
@@ -87,6 +152,98 @@ class ACTPolicy(PreTrainedPolicy):
                 "lr": self.config.optimizer_lr_backbone,
             },
         ]
+
+    def _prepare_batch_for_policy(
+        self, batch: dict[str, Tensor], config: ACTConfig | None = None
+    ) -> dict[str, Tensor]:
+        config = self.config if config is None else config
+        if not config.image_features:
+            return batch
+
+        batch = dict(batch)
+        batch[OBS_IMAGES] = [batch[key] for key in config.image_features]
+        return batch
+
+    def _validate_teacher_policy(self, teacher_policy: "ACTPolicy") -> None:
+        missing_inputs = [
+            key for key in teacher_policy.config.input_features if key not in self.config.input_features
+        ]
+        if missing_inputs:
+            raise ValueError(
+                "Teacher expects inputs that the student policy does not provide: " + ", ".join(missing_inputs)
+            )
+
+        mismatched_inputs = []
+        for key, teacher_feature in teacher_policy.config.input_features.items():
+            student_feature = self.config.input_features[key]
+            if student_feature.type != teacher_feature.type or student_feature.shape != teacher_feature.shape:
+                mismatched_inputs.append(key)
+        if mismatched_inputs:
+            raise ValueError(
+                "Teacher and student input features must match for KD. Mismatched keys: "
+                + ", ".join(mismatched_inputs)
+            )
+
+        teacher_action_feature = teacher_policy.config.action_feature
+        student_action_feature = self.config.action_feature
+        if teacher_action_feature is None or student_action_feature is None:
+            raise ValueError("Both teacher and student policies must define an `action` output feature for KD.")
+        if teacher_action_feature.shape != student_action_feature.shape:
+            raise ValueError(
+                "Teacher and student action dimensions must match for KD. "
+                f"Got teacher={teacher_action_feature.shape}, student={student_action_feature.shape}."
+            )
+
+    def _get_teacher_policy(self) -> "ACTPolicy":
+        teacher_policy = self.__dict__.get("_teacher_policy")
+        if teacher_policy is None:
+            teacher_source = self.config.teacher_policy_path or self.config.teacher_train_config
+            if teacher_source is None:
+                raise RuntimeError("KD is enabled but no teacher path was provided.")
+
+            teacher_pretrained_path = _resolve_teacher_pretrained_path(teacher_source)
+            teacher_policy = ACTPolicy.from_pretrained(teacher_pretrained_path)
+            teacher_policy.requires_grad_(False)
+            teacher_policy.eval()
+            self._validate_teacher_policy(teacher_policy)
+            self.__dict__["_teacher_policy"] = teacher_policy
+
+        return teacher_policy
+
+    def _get_kd_temporal_weights(self, overlap_steps: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+        if self.config.kd_temporal_decay == 0:
+            return torch.ones(overlap_steps, device=device, dtype=dtype)
+
+        positions = torch.arange(overlap_steps, device=device, dtype=dtype)
+        weights = torch.exp(-self.config.kd_temporal_decay * positions)
+        return weights / weights.mean()
+
+    def _compute_kd_loss(self, batch: dict[str, Tensor], actions_hat: Tensor) -> tuple[Tensor, int]:
+        teacher_policy = self._get_teacher_policy()
+        teacher_policy.to(actions_hat.device)
+        teacher_actions = teacher_policy.predict_action_chunk(batch).to(
+            device=actions_hat.device, dtype=actions_hat.dtype
+        )
+
+        overlap_steps = min(actions_hat.shape[1], teacher_actions.shape[1])
+        if self.config.kd_overlap_steps is not None:
+            overlap_steps = min(overlap_steps, self.config.kd_overlap_steps)
+        if overlap_steps <= 0:
+            raise ValueError(
+                "KD overlap is empty. Check `chunk_size`, teacher chunk size, and `kd_overlap_steps`."
+            )
+
+        kd_error = F.l1_loss(actions_hat[:, :overlap_steps], teacher_actions[:, :overlap_steps], reduction="none")
+
+        action_is_pad = batch.get("action_is_pad")
+        if action_is_pad is None:
+            mask = torch.ones_like(kd_error)
+        else:
+            mask = (~action_is_pad[:, :overlap_steps]).unsqueeze(-1).to(dtype=kd_error.dtype)
+
+        temporal_weights = self._get_kd_temporal_weights(overlap_steps, kd_error.device, kd_error.dtype)
+        kd_loss = (kd_error * mask * temporal_weights.view(1, overlap_steps, 1)).mean()
+        return kd_loss, overlap_steps
 
     def reset(self):
         """This should be called whenever the environment is reset."""
@@ -125,18 +282,14 @@ class ACTPolicy(PreTrainedPolicy):
         """Predict a chunk of actions given environment observations."""
         self.eval()
 
-        if self.config.image_features:
-            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+        batch = self._prepare_batch_for_policy(batch)
 
         actions = self.model(batch)[0]
         return actions
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
-        if self.config.image_features:
-            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+        batch = self._prepare_batch_for_policy(batch)
 
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
 
@@ -157,6 +310,12 @@ class ACTPolicy(PreTrainedPolicy):
             loss = l1_loss + mean_kld * self.config.kl_weight
         else:
             loss = l1_loss
+
+        if self.config.kd:
+            kd_loss, overlap_steps = self._compute_kd_loss(batch, actions_hat)
+            loss = loss + self.config.kd_weight * kd_loss
+            loss_dict["kd_l1_loss"] = kd_loss.item()
+            loss_dict["kd_overlap_steps"] = float(overlap_steps)
 
         return loss, loss_dict
 
@@ -399,6 +558,7 @@ class ACT(nn.Module):
             )
 
         batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
+        batch_device = _get_batch_device(batch)
 
         # Prepare the latent for input to the transformer encoder.
         if self.config.use_vae and ACTION in batch and self.training:
@@ -427,7 +587,7 @@ class ACT(nn.Module):
             cls_joint_is_pad = torch.full(
                 (batch_size, 2 if self.config.robot_state_feature else 1),
                 False,
-                device=batch[OBS_STATE].device,
+                device=batch_device,
             )
             key_padding_mask = torch.cat(
                 [cls_joint_is_pad, batch["action_is_pad"]], axis=1
@@ -450,9 +610,7 @@ class ACT(nn.Module):
             # When not using the VAE encoder, we set the latent to be all zeros.
             mu = log_sigma_x2 = None
             # TODO(rcadene, alexander-soare): remove call to `.to` to speedup forward ; precompute and use buffer
-            latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(
-                batch[OBS_STATE].device
-            )
+            latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32, device=batch_device)
 
         # Prepare transformer encoder inputs.
         encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]

@@ -18,7 +18,8 @@
 Edit LeRobot datasets using various transformation tools.
 
 This script allows you to delete episodes, split datasets, merge datasets,
-and remove features. When new_repo_id is specified, creates a new dataset.
+delete individual frames, and remove features. When new_repo_id is specified,
+creates a new dataset.
 
 Usage Examples:
 
@@ -34,6 +35,29 @@ Delete episodes and save to a new dataset:
         --new_repo_id lerobot/pusht_filtered \
         --operation.type delete_episodes \
         --operation.episode_indices "[0, 2, 5]"
+
+Delete a single frame inside episode 12:
+    python -m lerobot.scripts.lerobot_edit_dataset \
+        --repo_id admin123/grasp_block_in_bin \
+        --operation.type delete_frames \
+        --operation.episode_index 12 \
+        --operation.frame_indices "[123]"
+
+Delete frames by global dataset index:
+    python -m lerobot.scripts.lerobot_edit_dataset \
+        --repo_id admin123/grasp_block_in_bin \
+        --operation.type delete_frames \
+        --operation.global_indices "[5523]"
+
+Trim trailing static frames using the action delta at the end of each episode:
+    python -m lerobot.scripts.lerobot_edit_dataset \
+        --repo_id admin123/grasp_block_in_bin1 \
+        --new_repo_id admin123/grasp_block_in_bin1_trimmed_static_tail \
+        --operation.type trim_static_tail \
+        --operation.action_key action \
+        --operation.change_threshold 0.1 \
+        --operation.min_static_frames 1 \
+        --operation.diff_mode max_abs
 
 Split dataset by fractions:
     python -m lerobot.scripts.lerobot_edit_dataset \
@@ -77,10 +101,12 @@ from pathlib import Path
 
 from lerobot.configs import parser
 from lerobot.datasets.dataset_tools import (
+    delete_frames,
     delete_episodes,
     merge_datasets,
     remove_feature,
     split_dataset,
+    trim_static_tail_frames,
 )
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import HF_LEROBOT_HOME
@@ -91,6 +117,14 @@ from lerobot.utils.utils import init_logging
 class DeleteEpisodesConfig:
     type: str = "delete_episodes"
     episode_indices: list[int] | None = None
+
+
+@dataclass
+class DeleteFramesConfig:
+    type: str = "delete_frames"
+    episode_index: int | None = None
+    frame_indices: list[int] | None = None
+    global_indices: list[int] | None = None
 
 
 @dataclass
@@ -112,9 +146,25 @@ class RemoveFeatureConfig:
 
 
 @dataclass
+class TrimStaticTailConfig:
+    type: str = "trim_static_tail"
+    action_key: str = "action"
+    change_threshold: float = 0.0
+    min_static_frames: int = 1
+    diff_mode: str = "max_abs"
+
+
+@dataclass
 class EditDatasetConfig:
     repo_id: str
-    operation: DeleteEpisodesConfig | SplitConfig | MergeConfig | RemoveFeatureConfig
+    operation: (
+        DeleteEpisodesConfig
+        | DeleteFramesConfig
+        | SplitConfig
+        | MergeConfig
+        | RemoveFeatureConfig
+        | TrimStaticTailConfig
+    )
     root: str | None = None
     new_repo_id: str | None = None
     push_to_hub: bool = False
@@ -139,6 +189,17 @@ def get_output_path(repo_id: str, new_repo_id: str | None, root: Path | None) ->
     return output_repo_id, output_dir
 
 
+def get_input_path(repo_id: str, root: str | None) -> Path | None:
+    if root is None:
+        return None
+
+    root_path = Path(root)
+    repo_path = root_path / repo_id
+    if (repo_path / "meta" / "info.json").exists():
+        return repo_path
+    return root_path
+
+
 def handle_delete_episodes(cfg: EditDatasetConfig) -> None:
     if not isinstance(cfg.operation, DeleteEpisodesConfig):
         raise ValueError("Operation config must be DeleteEpisodesConfig")
@@ -146,7 +207,7 @@ def handle_delete_episodes(cfg: EditDatasetConfig) -> None:
     if not cfg.operation.episode_indices:
         raise ValueError("episode_indices must be specified for delete_episodes operation")
 
-    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    dataset = LeRobotDataset(cfg.repo_id, root=get_input_path(cfg.repo_id, cfg.root))
     output_repo_id, output_dir = get_output_path(
         cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
     )
@@ -170,6 +231,73 @@ def handle_delete_episodes(cfg: EditDatasetConfig) -> None:
         LeRobotDataset(output_repo_id, root=output_dir).push_to_hub()
 
 
+def handle_delete_frames(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, DeleteFramesConfig):
+        raise ValueError("Operation config must be DeleteFramesConfig")
+
+    if cfg.operation.global_indices is None and (
+        cfg.operation.episode_index is None or not cfg.operation.frame_indices
+    ):
+        raise ValueError(
+            "For delete_frames, provide either global_indices or episode_index with frame_indices"
+        )
+
+    dataset = LeRobotDataset(cfg.repo_id, root=get_input_path(cfg.repo_id, cfg.root))
+    output_repo_id, output_dir = get_output_path(
+        cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+    )
+
+    if cfg.new_repo_id is None:
+        dataset.root = Path(str(dataset.root) + "_old")
+
+    logging.info(f"Deleting frames from {cfg.repo_id}")
+    new_dataset = delete_frames(
+        dataset,
+        output_dir=output_dir,
+        repo_id=output_repo_id,
+        episode_index=cfg.operation.episode_index,
+        frame_indices=cfg.operation.frame_indices,
+        global_indices=cfg.operation.global_indices,
+    )
+
+    logging.info(f"Dataset saved to {output_dir}")
+    logging.info(f"Episodes: {new_dataset.meta.total_episodes}, Frames: {new_dataset.meta.total_frames}")
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {output_repo_id}")
+        LeRobotDataset(output_repo_id, root=output_dir).push_to_hub()
+
+
+def handle_trim_static_tail(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, TrimStaticTailConfig):
+        raise ValueError("Operation config must be TrimStaticTailConfig")
+
+    dataset = LeRobotDataset(cfg.repo_id, root=get_input_path(cfg.repo_id, cfg.root))
+    output_repo_id, output_dir = get_output_path(
+        cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+    )
+
+    if cfg.new_repo_id is None:
+        dataset.root = Path(str(dataset.root) + "_old")
+
+    new_dataset = trim_static_tail_frames(
+        dataset,
+        output_dir=output_dir,
+        repo_id=output_repo_id,
+        action_key=cfg.operation.action_key,
+        change_threshold=cfg.operation.change_threshold,
+        min_static_frames=cfg.operation.min_static_frames,
+        diff_mode=cfg.operation.diff_mode,
+    )
+
+    logging.info(f"Dataset saved to {output_dir}")
+    logging.info(f"Episodes: {new_dataset.meta.total_episodes}, Frames: {new_dataset.meta.total_frames}")
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {output_repo_id}")
+        LeRobotDataset(output_repo_id, root=output_dir).push_to_hub()
+
+
 def handle_split(cfg: EditDatasetConfig) -> None:
     if not isinstance(cfg.operation, SplitConfig):
         raise ValueError("Operation config must be SplitConfig")
@@ -179,7 +307,7 @@ def handle_split(cfg: EditDatasetConfig) -> None:
             "splits dict must be specified with split names as keys and fractions/episode lists as values"
         )
 
-    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    dataset = LeRobotDataset(cfg.repo_id, root=get_input_path(cfg.repo_id, cfg.root))
 
     logging.info(f"Splitting dataset {cfg.repo_id} with splits: {cfg.operation.splits}")
     split_datasets = split_dataset(dataset, splits=cfg.operation.splits)
@@ -206,7 +334,7 @@ def handle_merge(cfg: EditDatasetConfig) -> None:
         raise ValueError("repo_id must be specified as the output repository for merged dataset")
 
     logging.info(f"Loading {len(cfg.operation.repo_ids)} datasets to merge")
-    datasets = [LeRobotDataset(repo_id, root=cfg.root) for repo_id in cfg.operation.repo_ids]
+    datasets = [LeRobotDataset(repo_id, root=get_input_path(repo_id, cfg.root)) for repo_id in cfg.operation.repo_ids]
 
     output_dir = Path(cfg.root) / cfg.repo_id if cfg.root else HF_LEROBOT_HOME / cfg.repo_id
 
@@ -234,7 +362,7 @@ def handle_remove_feature(cfg: EditDatasetConfig) -> None:
     if not cfg.operation.feature_names:
         raise ValueError("feature_names must be specified for remove_feature operation")
 
-    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    dataset = LeRobotDataset(cfg.repo_id, root=get_input_path(cfg.repo_id, cfg.root))
     output_repo_id, output_dir = get_output_path(
         cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
     )
@@ -264,6 +392,10 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
 
     if operation_type == "delete_episodes":
         handle_delete_episodes(cfg)
+    elif operation_type == "delete_frames":
+        handle_delete_frames(cfg)
+    elif operation_type == "trim_static_tail":
+        handle_trim_static_tail(cfg)
     elif operation_type == "split":
         handle_split(cfg)
     elif operation_type == "merge":
@@ -273,7 +405,7 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
     else:
         raise ValueError(
             f"Unknown operation type: {operation_type}\n"
-            f"Available operations: delete_episodes, split, merge, remove_feature"
+            f"Available operations: delete_episodes, delete_frames, trim_static_tail, split, merge, remove_feature"
         )
 
 

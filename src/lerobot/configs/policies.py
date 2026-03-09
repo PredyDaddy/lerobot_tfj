@@ -16,7 +16,7 @@ import builtins
 import json
 import os
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from logging import getLogger
 from pathlib import Path
 from typing import Any, TypeVar
@@ -191,24 +191,32 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
                     f"{CONFIG_NAME} not found on the HuggingFace Hub in {model_id}"
                 ) from e
 
-        # HACK: Parse the original config to get the config subclass, so that we can
-        # apply cli overrides.
-        # This is very ugly, ideally we'd like to be able to do that natively with draccus
-        # something like --policy.path (in addition to --policy.type)
-        with draccus.config_type("json"):
-            orig_config = draccus.parse(cls, config_file, args=[])
-
         if config_file is None:
             raise FileNotFoundError(f"{CONFIG_NAME} not found in {model_id}")
 
         with open(config_file) as f:
             config = json.load(f)
 
-        config.pop("type")
+        config_type = config.pop("type", None)
+        if config_type is None:
+            raise ValueError(f"Missing required 'type' field in {config_file}")
+
+        config_cls = cls.get_choice_class(config_type)
+        valid_field_names = {f.name for f in fields(config_cls)}
+        unknown_field_names = sorted(set(config) - valid_field_names)
+        if unknown_field_names:
+            logger.warning(
+                "Ignoring unknown policy config fields for %s: %s",
+                config_cls.__name__,
+                ", ".join(unknown_field_names),
+            )
+            for key in unknown_field_names:
+                config.pop(key, None)
+
         with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
             json.dump(config, f)
             config_file = f.name
 
         cli_overrides = policy_kwargs.pop("cli_overrides", [])
         with draccus.config_type("json"):
-            return draccus.parse(orig_config.__class__, config_file, args=cli_overrides)
+            return draccus.parse(config_cls, config_file, args=cli_overrides)

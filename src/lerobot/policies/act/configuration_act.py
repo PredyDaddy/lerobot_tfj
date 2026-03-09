@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
@@ -132,6 +133,14 @@ class ACTConfig(PreTrainedConfig):
     dropout: float = 0.1
     kl_weight: float = 10.0
 
+    kd: bool = False
+    teacher_policy_path: Path | None = None
+    teacher_train_config: Path | None = None
+    kd_weight: float = 1.0
+    kd_overlap_steps: int | None = None
+    kd_temporal_decay: float = 0.0
+    decoder_out_dim: int = 1024
+
     # Training preset
     optimizer_lr: float = 1e-5
     optimizer_weight_decay: float = 1e-4
@@ -159,6 +168,21 @@ class ACTConfig(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
+        if self.kd:
+            if self.teacher_policy_path is None and self.teacher_train_config is None:
+                raise ValueError(
+                    "When `kd=True`, please set `teacher_policy_path` (preferred) or `teacher_train_config`."
+                )
+            if self.kd_weight <= 0:
+                raise ValueError(f"`kd_weight` must be strictly positive. Got {self.kd_weight}.")
+            if self.kd_overlap_steps is not None and self.kd_overlap_steps <= 0:
+                raise ValueError(
+                    f"`kd_overlap_steps` must be strictly positive when provided. Got {self.kd_overlap_steps}."
+                )
+            if self.kd_temporal_decay < 0:
+                raise ValueError(
+                    f"`kd_temporal_decay` must be non-negative. Got {self.kd_temporal_decay}."
+                )
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(

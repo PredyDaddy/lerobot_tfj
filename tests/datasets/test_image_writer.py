@@ -129,6 +129,15 @@ def test_write_image_numpy(tmp_path, img_array_factory):
     assert np.array_equal(image_array, saved_image)
 
 
+def test_write_image_creates_parent_dirs(tmp_path, img_array_factory):
+    image_array = img_array_factory()
+    fpath = tmp_path / "nested" / "deeper" / DUMMY_IMAGE
+    write_image(image_array, fpath)
+    assert fpath.exists()
+    saved_image = np.array(Image.open(fpath))
+    assert np.array_equal(image_array, saved_image)
+
+
 def test_write_image_image(tmp_path, img_factory):
     image_pil = img_factory()
     fpath = tmp_path / DUMMY_IMAGE

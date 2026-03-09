@@ -23,11 +23,14 @@ import torch
 
 from lerobot.datasets.dataset_tools import (
     add_features,
+    delete_frames,
     delete_episodes,
+    find_trailing_static_frame_indices,
     merge_datasets,
     modify_features,
     remove_feature,
     split_dataset,
+    trim_static_tail_frames,
 )
 
 
@@ -58,6 +61,304 @@ def sample_dataset(tmp_path, empty_lerobot_dataset_factory):
 
     dataset.finalize()
     return dataset
+
+
+@pytest.fixture
+def frame_edit_dataset(tmp_path, empty_lerobot_dataset_factory):
+    features = {
+        "action": {"dtype": "float32", "shape": (2,), "names": None},
+        "observation.state": {"dtype": "float32", "shape": (2,), "names": None},
+        "observation.images.top": {"dtype": "image", "shape": (16, 16, 3), "names": None},
+    }
+
+    dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "frame_edit_dataset",
+        features=features,
+        use_videos=False,
+    )
+
+    for ep_idx in range(3):
+        for frame_idx in range(4):
+            pixel_value = ep_idx * 10 + frame_idx
+            frame = {
+                "action": np.array([pixel_value, pixel_value + 0.5], dtype=np.float32),
+                "observation.state": np.array([ep_idx, frame_idx], dtype=np.float32),
+                "observation.images.top": np.full((16, 16, 3), pixel_value, dtype=np.uint8),
+                "task": f"task_{ep_idx}",
+            }
+            dataset.add_frame(frame)
+        dataset.save_episode()
+
+    dataset.finalize()
+    return dataset
+
+
+@pytest.fixture
+def static_tail_dataset(tmp_path, empty_lerobot_dataset_factory):
+    features = {
+        "action": {"dtype": "float32", "shape": (2,), "names": None},
+        "observation.state": {"dtype": "float32", "shape": (2,), "names": None},
+        "observation.images.top": {"dtype": "image", "shape": (16, 16, 3), "names": None},
+    }
+
+    dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "static_tail_dataset",
+        features=features,
+        use_videos=False,
+    )
+
+    episode_actions = [
+        [
+            np.array([0.0, 0.5], dtype=np.float32),
+            np.array([1.0, 1.5], dtype=np.float32),
+            np.array([2.0, 2.5], dtype=np.float32),
+            np.array([2.0, 2.5], dtype=np.float32),
+            np.array([2.0, 2.5], dtype=np.float32),
+        ],
+        [
+            np.array([10.0, 10.5], dtype=np.float32),
+            np.array([11.0, 11.5], dtype=np.float32),
+            np.array([12.0, 12.5], dtype=np.float32),
+            np.array([13.0, 13.5], dtype=np.float32),
+            np.array([13.0, 13.5], dtype=np.float32),
+        ],
+        [
+            np.array([20.0, 20.5], dtype=np.float32),
+            np.array([21.0, 21.5], dtype=np.float32),
+            np.array([22.0, 22.5], dtype=np.float32),
+            np.array([23.0, 23.5], dtype=np.float32),
+            np.array([24.0, 24.5], dtype=np.float32),
+        ],
+    ]
+
+    for ep_idx, actions in enumerate(episode_actions):
+        for frame_idx, action in enumerate(actions):
+            frame = {
+                "action": action,
+                "observation.state": np.array([ep_idx, frame_idx], dtype=np.float32),
+                "observation.images.top": np.full((16, 16, 3), ep_idx * 10 + frame_idx, dtype=np.uint8),
+                "task": f"task_{ep_idx}",
+            }
+            dataset.add_frame(frame)
+        dataset.save_episode()
+
+    dataset.finalize()
+    return dataset
+
+
+@pytest.fixture
+def small_change_static_tail_dataset(tmp_path, empty_lerobot_dataset_factory):
+    features = {
+        "action": {"dtype": "float32", "shape": (2,), "names": None},
+        "observation.state": {"dtype": "float32", "shape": (2,), "names": None},
+        "observation.images.top": {"dtype": "image", "shape": (16, 16, 3), "names": None},
+    }
+
+    dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "small_change_static_tail_dataset",
+        features=features,
+        use_videos=False,
+    )
+
+    episode_actions = [
+        [
+            np.array([0.0, 0.0], dtype=np.float32),
+            np.array([1.0, 1.0], dtype=np.float32),
+            np.array([2.0, 2.0], dtype=np.float32),
+            np.array([2.04, 2.0], dtype=np.float32),
+            np.array([2.05, 2.02], dtype=np.float32),
+        ],
+        [
+            np.array([10.0, 10.0], dtype=np.float32),
+            np.array([11.0, 11.0], dtype=np.float32),
+            np.array([12.0, 12.0], dtype=np.float32),
+            np.array([13.0, 13.0], dtype=np.float32),
+            np.array([13.03, 13.0], dtype=np.float32),
+        ],
+    ]
+
+    for ep_idx, actions in enumerate(episode_actions):
+        for frame_idx, action in enumerate(actions):
+            frame = {
+                "action": action,
+                "observation.state": np.array([ep_idx, frame_idx], dtype=np.float32),
+                "observation.images.top": np.full((16, 16, 3), ep_idx * 10 + frame_idx, dtype=np.uint8),
+                "task": f"task_{ep_idx}",
+            }
+            dataset.add_frame(frame)
+        dataset.save_episode()
+
+    dataset.finalize()
+    return dataset
+
+
+def test_delete_frames_by_episode(frame_edit_dataset, tmp_path):
+    output_dir = tmp_path / "frame_filtered"
+
+    new_dataset = delete_frames(
+        frame_edit_dataset,
+        output_dir=output_dir,
+        episode_index=1,
+        frame_indices=[2],
+    )
+
+    assert new_dataset.meta.total_episodes == 3
+    assert new_dataset.meta.total_frames == 11
+    assert [new_dataset.meta.episodes[i]["length"] for i in range(3)] == [4, 3, 4]
+    assert new_dataset.meta.episodes[2]["dataset_from_index"] == 7
+    assert new_dataset.meta.episodes[2]["dataset_to_index"] == 11
+
+    from_idx = int(new_dataset.meta.episodes[1]["dataset_from_index"])
+    to_idx = int(new_dataset.meta.episodes[1]["dataset_to_index"])
+
+    actions = [new_dataset[idx]["action"].numpy().tolist() for idx in range(from_idx, to_idx)]
+    frame_indices = [int(new_dataset[idx]["frame_index"].item()) for idx in range(from_idx, to_idx)]
+    timestamps = [float(new_dataset[idx]["timestamp"].item()) for idx in range(from_idx, to_idx)]
+
+    assert actions == [[10.0, 10.5], [11.0, 11.5], [13.0, 13.5]]
+    assert frame_indices == [0, 1, 2]
+    assert timestamps == pytest.approx([0.0, 1 / 30, 2 / 30], abs=1e-6)
+
+
+def test_delete_frames_by_global_index(frame_edit_dataset, tmp_path):
+    output_dir = tmp_path / "frame_filtered_global"
+
+    new_dataset = delete_frames(
+        frame_edit_dataset,
+        output_dir=output_dir,
+        global_indices=[1, 8],
+    )
+
+    assert new_dataset.meta.total_episodes == 3
+    assert new_dataset.meta.total_frames == 10
+    assert [new_dataset.meta.episodes[i]["length"] for i in range(3)] == [3, 4, 3]
+    assert new_dataset.meta.episodes[1]["dataset_from_index"] == 3
+    assert new_dataset.meta.episodes[1]["dataset_to_index"] == 7
+    assert new_dataset.meta.episodes[2]["dataset_from_index"] == 7
+    assert new_dataset.meta.episodes[2]["dataset_to_index"] == 10
+
+    ep0_from = int(new_dataset.meta.episodes[0]["dataset_from_index"])
+    ep0_to = int(new_dataset.meta.episodes[0]["dataset_to_index"])
+    ep2_from = int(new_dataset.meta.episodes[2]["dataset_from_index"])
+    ep2_to = int(new_dataset.meta.episodes[2]["dataset_to_index"])
+
+    ep0_actions = [new_dataset[idx]["action"].numpy().tolist() for idx in range(ep0_from, ep0_to)]
+    ep2_actions = [new_dataset[idx]["action"].numpy().tolist() for idx in range(ep2_from, ep2_to)]
+
+    assert ep0_actions == [[0.0, 0.5], [2.0, 2.5], [3.0, 3.5]]
+    assert ep2_actions == [[21.0, 21.5], [22.0, 22.5], [23.0, 23.5]]
+
+
+def test_find_trailing_static_frame_indices(static_tail_dataset):
+    frames_to_delete = find_trailing_static_frame_indices(
+        static_tail_dataset,
+        delta_threshold=0.05,
+        keep_last_n=1,
+        min_tail_length=2,
+    )
+
+    assert frames_to_delete == {0: [3, 4], 1: [9]}
+
+
+def test_trim_trailing_static_frames_via_delete_frames(static_tail_dataset, tmp_path):
+    frames_to_delete = find_trailing_static_frame_indices(
+        static_tail_dataset,
+        delta_threshold=0.05,
+        keep_last_n=1,
+        min_tail_length=2,
+    )
+    global_indices = sorted(idx for indices in frames_to_delete.values() for idx in indices)
+
+    new_dataset = delete_frames(
+        static_tail_dataset,
+        output_dir=tmp_path / "trimmed_static_tail",
+        global_indices=global_indices,
+    )
+
+    assert new_dataset.meta.total_episodes == 3
+    assert new_dataset.meta.total_frames == 12
+    assert [new_dataset.meta.episodes[i]["length"] for i in range(3)] == [3, 4, 5]
+
+    ep0_from = int(new_dataset.meta.episodes[0]["dataset_from_index"])
+    ep0_to = int(new_dataset.meta.episodes[0]["dataset_to_index"])
+    ep1_from = int(new_dataset.meta.episodes[1]["dataset_from_index"])
+    ep1_to = int(new_dataset.meta.episodes[1]["dataset_to_index"])
+
+    ep0_actions = [new_dataset[idx]["action"].numpy().tolist() for idx in range(ep0_from, ep0_to)]
+    ep1_actions = [new_dataset[idx]["action"].numpy().tolist() for idx in range(ep1_from, ep1_to)]
+
+    assert ep0_actions == [[0.0, 0.5], [1.0, 1.5], [2.0, 2.5]]
+    assert ep1_actions == [[10.0, 10.5], [11.0, 11.5], [12.0, 12.5], [13.0, 13.5]]
+
+
+def test_trim_static_tail_frames_trims_small_tail_changes(small_change_static_tail_dataset, tmp_path):
+    new_dataset = trim_static_tail_frames(
+        small_change_static_tail_dataset,
+        output_dir=tmp_path / "trim_static_tail_frames",
+        change_threshold=0.05,
+        min_static_frames=1,
+        diff_mode="max_abs",
+    )
+
+    assert new_dataset.meta.total_episodes == 2
+    assert new_dataset.meta.total_frames == 7
+    assert [new_dataset.meta.episodes[i]["length"] for i in range(2)] == [3, 4]
+
+    ep0_from = int(new_dataset.meta.episodes[0]["dataset_from_index"])
+    ep0_to = int(new_dataset.meta.episodes[0]["dataset_to_index"])
+    ep1_from = int(new_dataset.meta.episodes[1]["dataset_from_index"])
+    ep1_to = int(new_dataset.meta.episodes[1]["dataset_to_index"])
+
+    ep0_actions = [new_dataset[idx]["action"].numpy().tolist() for idx in range(ep0_from, ep0_to)]
+    ep1_actions = [new_dataset[idx]["action"].numpy().tolist() for idx in range(ep1_from, ep1_to)]
+
+    assert ep0_actions == [[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]
+    assert ep1_actions == [[10.0, 10.0], [11.0, 11.0], [12.0, 12.0], [13.0, 13.0]]
+
+
+def test_trim_static_tail_frames_respects_min_static_frames(
+    small_change_static_tail_dataset, tmp_path
+):
+    new_dataset = trim_static_tail_frames(
+        small_change_static_tail_dataset,
+        output_dir=tmp_path / "trim_static_tail_min_frames",
+        change_threshold=0.05,
+        min_static_frames=2,
+        diff_mode="max_abs",
+    )
+
+    assert new_dataset.meta.total_episodes == 2
+    assert new_dataset.meta.total_frames == 8
+    assert [new_dataset.meta.episodes[i]["length"] for i in range(2)] == [3, 5]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"change_threshold": -0.1}, "change_threshold must be non-negative"),
+        ({"min_static_frames": 0}, "min_static_frames must be at least 1"),
+        ({"diff_mode": "bad-mode"}, "diff_mode must be one of: max_abs, l2"),
+    ],
+)
+def test_trim_static_tail_frames_rejects_invalid_args(
+    small_change_static_tail_dataset, tmp_path, kwargs, message
+):
+    with pytest.raises(ValueError, match=message):
+        trim_static_tail_frames(
+            small_change_static_tail_dataset,
+            output_dir=tmp_path / "trim_static_tail_invalid",
+            **kwargs,
+        )
+
+
+def test_delete_frames_rejects_deleting_entire_episode(frame_edit_dataset, tmp_path):
+    with pytest.raises(ValueError, match="Cannot delete all frames from episode 0"):
+        delete_frames(
+            frame_edit_dataset,
+            output_dir=tmp_path / "invalid_frame_delete",
+            episode_index=0,
+            frame_indices=[0, 1, 2, 3],
+        )
 
 
 def test_delete_single_episode(sample_dataset, tmp_path):

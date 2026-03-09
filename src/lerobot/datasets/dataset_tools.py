@@ -36,11 +36,12 @@ import torch
 from tqdm import tqdm
 
 from lerobot.datasets.aggregate import aggregate_datasets
-from lerobot.datasets.compute_stats import aggregate_stats
+from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.utils import (
     DATA_DIR,
     DEFAULT_CHUNK_SIZE,
+    DEFAULT_FEATURES,
     DEFAULT_DATA_FILE_SIZE_IN_MB,
     DEFAULT_DATA_PATH,
     DEFAULT_EPISODES_PATH,
@@ -137,6 +138,671 @@ def delete_episodes(
 
     logging.info(f"Created new dataset with {len(episodes_to_keep)} episodes")
     return new_dataset
+
+
+def _resolve_frames_to_delete(
+    dataset: LeRobotDataset,
+    episode_index: int | None = None,
+    frame_indices: list[int] | None = None,
+    global_indices: list[int] | None = None,
+) -> dict[int, set[int]]:
+    using_episode_frames = episode_index is not None or frame_indices is not None
+    using_global_indices = global_indices is not None
+
+    if using_episode_frames == using_global_indices:
+        raise ValueError(
+            "Specify either (episode_index + frame_indices) or global_indices when deleting frames"
+        )
+
+    if using_episode_frames:
+        if episode_index is None:
+            raise ValueError("episode_index must be provided when frame_indices are used")
+        if not frame_indices:
+            raise ValueError("frame_indices must contain at least one frame index")
+        if episode_index < 0 or episode_index >= dataset.meta.total_episodes:
+            raise ValueError(f"Invalid episode index: {episode_index}")
+
+        episode_length = int(dataset.meta.episodes[episode_index]["length"])
+        invalid = sorted({frame_idx for frame_idx in frame_indices if frame_idx < 0 or frame_idx >= episode_length})
+        if invalid:
+            raise ValueError(
+                f"Invalid frame indices for episode {episode_index}: {invalid}. "
+                f"Episode length is {episode_length}."
+            )
+
+        return {episode_index: set(frame_indices)}
+
+    assert global_indices is not None
+    if len(global_indices) == 0:
+        raise ValueError("global_indices must contain at least one frame index")
+
+    invalid = sorted({idx for idx in global_indices if idx < 0 or idx >= dataset.meta.total_frames})
+    if invalid:
+        raise ValueError(
+            f"Invalid global frame indices: {invalid}. Dataset contains {dataset.meta.total_frames} frames."
+        )
+
+    frames_to_delete: dict[int, set[int]] = {}
+    for global_idx in sorted(set(global_indices)):
+        item = dataset.hf_dataset[int(global_idx)]
+        ep_idx = int(item["episode_index"])
+        frame_idx = int(item["frame_index"])
+        frames_to_delete.setdefault(ep_idx, set()).add(frame_idx)
+
+    return frames_to_delete
+
+
+def _rebuild_dataset_without_frames(
+    src_dataset: LeRobotDataset,
+    frames_to_delete: dict[int, set[int]],
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+) -> LeRobotDataset:
+    for ep_idx, frame_ids in sorted(frames_to_delete.items()):
+        episode_length = int(src_dataset.meta.episodes[ep_idx]["length"])
+        if len(frame_ids) >= episode_length:
+            raise ValueError(
+                f"Cannot delete all frames from episode {ep_idx}. Episode length is {episode_length}."
+            )
+
+    total_deleted = sum(len(frame_ids) for frame_ids in frames_to_delete.values())
+    logging.info(f"Deleting {total_deleted} frame(s) across {len(frames_to_delete)} episode(s)")
+
+    if repo_id is None:
+        repo_id = f"{src_dataset.repo_id}_modified"
+    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+
+    new_dataset = LeRobotDataset.create(
+        repo_id=repo_id,
+        fps=src_dataset.meta.fps,
+        features=src_dataset.meta.features,
+        robot_type=src_dataset.meta.robot_type,
+        root=output_dir,
+        use_videos=len(src_dataset.meta.video_keys) > 0,
+        tolerance_s=src_dataset.tolerance_s,
+        video_backend=src_dataset.video_backend,
+    )
+    new_dataset.meta.update_chunk_settings(
+        chunks_size=src_dataset.meta.chunks_size,
+        data_files_size_in_mb=src_dataset.meta.data_files_size_in_mb,
+        video_files_size_in_mb=src_dataset.meta.video_files_size_in_mb,
+    )
+
+    feature_keys = [key for key in src_dataset.features if key not in DEFAULT_FEATURES]
+
+    for ep_idx in tqdm(range(src_dataset.meta.total_episodes), desc="Rebuilding episodes"):
+        ep_meta = src_dataset.meta.episodes[ep_idx]
+        from_idx = int(ep_meta["dataset_from_index"])
+        to_idx = int(ep_meta["dataset_to_index"])
+        delete_local_indices = frames_to_delete.get(ep_idx, set())
+
+        for global_idx in range(from_idx, to_idx):
+            local_frame_idx = global_idx - from_idx
+            if local_frame_idx in delete_local_indices:
+                continue
+
+            item = src_dataset[global_idx]
+            frame = {}
+            for key in feature_keys:
+                value = item[key]
+                if src_dataset.features[key]["dtype"] in ["image", "video"] and hasattr(value, "shape"):
+                    expected_shape = tuple(src_dataset.features[key]["shape"])
+                    chw_shape = (expected_shape[2], expected_shape[0], expected_shape[1])
+                    if tuple(value.shape) == chw_shape:
+                        value = value.permute(1, 2, 0) if isinstance(value, torch.Tensor) else np.transpose(value, (1, 2, 0))
+                frame[key] = value
+            frame["task"] = item["task"]
+            new_dataset.add_frame(frame)
+
+        new_dataset.save_episode()
+
+    new_dataset.finalize()
+
+    logging.info(
+        "Created new dataset with %s episodes and %s frames",
+        new_dataset.meta.total_episodes,
+        new_dataset.meta.total_frames,
+    )
+
+    return LeRobotDataset(
+        repo_id=repo_id,
+        root=output_dir,
+        image_transforms=src_dataset.image_transforms,
+        delta_timestamps=src_dataset.delta_timestamps,
+        tolerance_s=src_dataset.tolerance_s,
+        download_videos=False,
+        video_backend=src_dataset.video_backend,
+    )
+
+
+def _resolve_static_tail_frames_to_delete(
+    dataset: LeRobotDataset,
+    action_key: str = "action",
+    change_threshold: float = 0.0,
+    min_static_frames: int = 1,
+    diff_mode: str = "max_abs",
+) -> dict[int, set[int]]:
+    if dataset.episodes is not None:
+        raise ValueError("trim_static_tail_frames requires loading the full dataset, not a subset of episodes")
+    if action_key not in dataset.hf_dataset.column_names:
+        raise ValueError(f"Action key '{action_key}' not found in dataset columns")
+    if change_threshold < 0:
+        raise ValueError("change_threshold must be non-negative")
+    if min_static_frames < 1:
+        raise ValueError("min_static_frames must be at least 1")
+    if diff_mode not in {"max_abs", "l2"}:
+        raise ValueError("diff_mode must be one of: max_abs, l2")
+
+    frames_to_delete: dict[int, set[int]] = {}
+
+    for ep_idx in range(dataset.meta.total_episodes):
+        ep_meta = dataset.meta.episodes[ep_idx]
+        from_idx = int(ep_meta["dataset_from_index"])
+        to_idx = int(ep_meta["dataset_to_index"])
+        actions = np.asarray(dataset.hf_dataset[action_key][from_idx:to_idx], dtype=np.float32)
+
+        if len(actions) <= 1:
+            continue
+
+        action_deltas = np.diff(actions, axis=0)
+        if diff_mode == "max_abs":
+            delta_values = np.abs(action_deltas).max(axis=1)
+        else:
+            delta_values = np.linalg.norm(action_deltas, axis=1)
+
+        tail_static_transitions = 0
+        for delta in delta_values[::-1]:
+            if delta <= change_threshold:
+                tail_static_transitions += 1
+            else:
+                break
+
+        if tail_static_transitions < min_static_frames:
+            continue
+
+        first_deleted_frame = len(actions) - tail_static_transitions
+        frames_to_delete[ep_idx] = set(range(first_deleted_frame, len(actions)))
+
+    return frames_to_delete
+
+
+def _trim_static_tail_video_dataset(
+    src_dataset: LeRobotDataset,
+    frames_to_delete: dict[int, set[int]],
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+) -> LeRobotDataset:
+    if repo_id is None:
+        repo_id = f"{src_dataset.repo_id}_modified"
+    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+
+    dst_meta = LeRobotDatasetMetadata.create(
+        repo_id=repo_id,
+        fps=src_dataset.meta.fps,
+        features=src_dataset.meta.features,
+        robot_type=src_dataset.meta.robot_type,
+        root=output_dir,
+        use_videos=len(src_dataset.meta.video_keys) > 0,
+    )
+    dst_meta.update_chunk_settings(
+        chunks_size=src_dataset.meta.chunks_size,
+        data_files_size_in_mb=src_dataset.meta.data_files_size_in_mb,
+        video_files_size_in_mb=src_dataset.meta.video_files_size_in_mb,
+    )
+
+    if src_dataset.meta.tasks is not None:
+        write_tasks(src_dataset.meta.tasks, dst_meta.root)
+        dst_meta.tasks = src_dataset.meta.tasks.copy()
+
+    if src_dataset.meta.episodes is None:
+        src_dataset.meta.episodes = load_episodes(src_dataset.meta.root)
+
+    numeric_features = {
+        key: ft for key, ft in src_dataset.meta.features.items() if ft["dtype"] not in ["image", "video"]
+    }
+    file_to_episodes: dict[Path, list[int]] = {}
+    for ep_idx in range(src_dataset.meta.total_episodes):
+        file_path = src_dataset.meta.get_data_file_path(ep_idx)
+        file_to_episodes.setdefault(file_path, []).append(ep_idx)
+
+    global_index = 0
+    episode_lengths: dict[int, int] = {}
+    episode_stats: dict[int, dict[str, dict]] = {}
+
+    for src_path in tqdm(sorted(file_to_episodes.keys()), desc="Processing trimmed data files"):
+        df = pd.read_parquet(src_dataset.root / src_path)
+        rewritten_frames = []
+
+        for ep_idx in sorted(file_to_episodes[src_path]):
+            ep_df = df[df["episode_index"] == ep_idx].sort_values("frame_index").copy().reset_index(drop=True)
+            delete_local_indices = frames_to_delete.get(ep_idx, set())
+            if delete_local_indices:
+                ep_df = ep_df[~ep_df["frame_index"].isin(delete_local_indices)].copy().reset_index(drop=True)
+
+            if len(ep_df) == 0:
+                raise ValueError(f"Episode {ep_idx} became empty after trimming")
+
+            ep_df["frame_index"] = np.arange(len(ep_df), dtype=np.int64)
+            ep_df["timestamp"] = ep_df["frame_index"].to_numpy(dtype=np.float32) / src_dataset.meta.fps
+            ep_df["index"] = np.arange(global_index, global_index + len(ep_df), dtype=np.int64)
+
+            stats_input = {}
+            for key, ft in numeric_features.items():
+                if key not in ep_df.columns:
+                    continue
+                shape = tuple(ft["shape"])
+                if shape == (1,):
+                    stats_input[key] = ep_df[key].to_numpy().reshape(-1, 1)
+                else:
+                    stats_input[key] = np.stack(ep_df[key].map(np.asarray).to_list())
+
+            episode_stats[ep_idx] = compute_episode_stats(stats_input, numeric_features)
+            episode_lengths[ep_idx] = len(ep_df)
+            rewritten_frames.append(ep_df)
+            global_index += len(ep_df)
+
+        rewritten_df = pd.concat(rewritten_frames, ignore_index=True)
+        dst_path = dst_meta.root / src_path
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_parquet(rewritten_df, dst_path, dst_meta)
+
+    video_metadata: dict[int, dict[str, int | float]] = {ep_idx: {} for ep_idx in range(src_dataset.meta.total_episodes)}
+    for video_key in src_dataset.meta.video_keys:
+        file_to_episodes: dict[tuple[int, int], list[int]] = {}
+        for ep_idx in range(src_dataset.meta.total_episodes):
+            src_ep = src_dataset.meta.episodes[ep_idx]
+            chunk_idx = int(src_ep[f"videos/{video_key}/chunk_index"])
+            file_idx = int(src_ep[f"videos/{video_key}/file_index"])
+            file_to_episodes.setdefault((chunk_idx, file_idx), []).append(ep_idx)
+
+        for (chunk_idx, file_idx), episode_indices in tqdm(
+            sorted(file_to_episodes.items()), desc=f"Trimming {video_key} video files"
+        ):
+            if src_dataset.meta.video_path is None or dst_meta.video_path is None:
+                raise ValueError("Source or destination metadata has no video_path defined")
+
+            src_video_path = src_dataset.root / src_dataset.meta.video_path.format(
+                video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
+            )
+            dst_video_path = dst_meta.root / dst_meta.video_path.format(
+                video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
+            )
+            dst_video_path.parent.mkdir(parents=True, exist_ok=True)
+
+            kept_ranges: list[tuple[float, float]] = []
+            current_out_ts = 0.0
+            for ep_idx in sorted(episode_indices):
+                src_ep = src_dataset.meta.episodes[ep_idx]
+                src_from_ts = float(src_ep[f"videos/{video_key}/from_timestamp"])
+                duration = episode_lengths[ep_idx] / src_dataset.meta.fps
+                kept_ranges.append((src_from_ts, src_from_ts + duration))
+                video_metadata[ep_idx][f"videos/{video_key}/chunk_index"] = chunk_idx
+                video_metadata[ep_idx][f"videos/{video_key}/file_index"] = file_idx
+                video_metadata[ep_idx][f"videos/{video_key}/from_timestamp"] = current_out_ts
+                video_metadata[ep_idx][f"videos/{video_key}/to_timestamp"] = current_out_ts + duration
+                current_out_ts += duration
+
+            _keep_episodes_from_video_with_av(
+                src_video_path,
+                dst_video_path,
+                kept_ranges,
+                fps=src_dataset.meta.fps,
+            )
+
+    for ep_idx in tqdm(range(src_dataset.meta.total_episodes), desc="Writing trimmed episode metadata"):
+        episode_dict = _load_episode_with_stats(src_dataset, ep_idx)
+        episode_dict["episode_index"] = ep_idx
+        episode_dict["length"] = episode_lengths[ep_idx]
+
+        for video_key in src_dataset.meta.video_keys:
+            episode_dict[f"videos/{video_key}/chunk_index"] = video_metadata[ep_idx][
+                f"videos/{video_key}/chunk_index"
+            ]
+            episode_dict[f"videos/{video_key}/file_index"] = video_metadata[ep_idx][
+                f"videos/{video_key}/file_index"
+            ]
+            episode_dict[f"videos/{video_key}/from_timestamp"] = video_metadata[ep_idx][
+                f"videos/{video_key}/from_timestamp"
+            ]
+            episode_dict[f"videos/{video_key}/to_timestamp"] = video_metadata[ep_idx][
+                f"videos/{video_key}/to_timestamp"
+            ]
+
+        for feature_name, feature_stats in episode_stats[ep_idx].items():
+            for stat_name, stat_value in feature_stats.items():
+                episode_dict[f"stats/{feature_name}/{stat_name}"] = stat_value
+
+        dst_meta._save_episode_metadata(episode_dict)
+
+    dst_meta._close_writer()
+    dst_meta.info.update(
+        {
+            "total_episodes": src_dataset.meta.total_episodes,
+            "total_frames": global_index,
+            "total_tasks": len(dst_meta.tasks) if dst_meta.tasks is not None else 0,
+            "splits": src_dataset.meta.info.get("splits", {"train": f"0:{src_dataset.meta.total_episodes}"}),
+        }
+    )
+    for key in dst_meta.video_keys:
+        dst_meta.info["features"][key]["info"] = src_dataset.meta.info["features"][key].get("info", {})
+    write_info(dst_meta.info, dst_meta.root)
+
+    if src_dataset.meta.stats:
+        updated_stats = {key: value for key, value in src_dataset.meta.stats.items() if key in dst_meta.features}
+        aggregated_numeric_stats = aggregate_stats([episode_stats[idx] for idx in range(src_dataset.meta.total_episodes)])
+        updated_stats.update(aggregated_numeric_stats)
+        write_stats(updated_stats, dst_meta.root)
+
+    return LeRobotDataset(
+        repo_id=repo_id,
+        root=output_dir,
+        image_transforms=src_dataset.image_transforms,
+        delta_timestamps=src_dataset.delta_timestamps,
+        tolerance_s=src_dataset.tolerance_s,
+        download_videos=False,
+        video_backend=src_dataset.video_backend,
+    )
+
+
+def trim_static_tail_frames(
+    dataset: LeRobotDataset,
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+    action_key: str = "action",
+    change_threshold: float = 0.0,
+    min_static_frames: int = 1,
+    diff_mode: str = "max_abs",
+) -> LeRobotDataset:
+    """Trim the static tail of each episode based on small action changes.
+
+    This rebuilds the dataset and removes trailing frames whose action change from the previous
+    frame stays below ``change_threshold`` for at least ``min_static_frames`` consecutive tail frames.
+
+    Args:
+        dataset: The source LeRobotDataset. Must be the full dataset, not a subset of episodes.
+        output_dir: Directory to save the new dataset. If None, uses the default cache location.
+        repo_id: Repository ID for the new dataset. If None, appends "_modified" to the original repo id.
+        action_key: Dataset key used to measure action changes.
+        change_threshold: Maximum per-step action change still considered static.
+        min_static_frames: Minimum number of trailing frames required before trimming starts.
+        diff_mode: Metric used to measure action deltas. Supported values are "max_abs" and "l2".
+    """
+    src_dataset = LeRobotDataset(
+        dataset.repo_id,
+        root=dataset.root,
+        tolerance_s=dataset.tolerance_s,
+        download_videos=False,
+        video_backend=dataset.video_backend,
+    )
+
+    frames_to_delete = _resolve_static_tail_frames_to_delete(
+        src_dataset,
+        action_key=action_key,
+        change_threshold=change_threshold,
+        min_static_frames=min_static_frames,
+        diff_mode=diff_mode,
+    )
+
+    trimmed_episodes = len(frames_to_delete)
+    trimmed_frames = sum(len(frame_ids) for frame_ids in frames_to_delete.values())
+    logging.info(
+        "Trimming static tails with action_key=%s, threshold=%s, min_static_frames=%s, diff_mode=%s",
+        action_key,
+        change_threshold,
+        min_static_frames,
+        diff_mode,
+    )
+    logging.info("Detected %s trailing static frame(s) across %s episode(s)", trimmed_frames, trimmed_episodes)
+
+    if src_dataset.meta.video_keys:
+        logging.info("Using metadata-only trim path for video-backed dataset")
+        return _trim_static_tail_video_dataset(
+            src_dataset,
+            frames_to_delete=frames_to_delete,
+            output_dir=output_dir,
+            repo_id=repo_id,
+        )
+
+    return _rebuild_dataset_without_frames(
+        src_dataset,
+        frames_to_delete=frames_to_delete,
+        output_dir=output_dir,
+        repo_id=repo_id,
+    )
+
+
+def delete_frames(
+    dataset: LeRobotDataset,
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+    episode_index: int | None = None,
+    frame_indices: list[int] | None = None,
+    global_indices: list[int] | None = None,
+) -> LeRobotDataset:
+    """Delete specific frames from a LeRobotDataset by rebuilding a consistent dataset.
+
+    This operation intentionally rewrites the dataset instead of editing parquet/video files in place.
+    Removing a single frame changes global indices, per-episode frame indices, timestamps, video offsets,
+    and aggregated statistics. Rebuilding through the official LeRobot reader/writer path keeps all of
+    these artifacts consistent.
+
+    Args:
+        dataset: The source dataset. Must be the full dataset, not a subset of episodes.
+        output_dir: Directory to save the new dataset. If None, uses the default cache location.
+        repo_id: Repository ID for the new dataset. If None, appends "_modified" to the original repo id.
+        episode_index: Episode index containing the frame(s) to delete.
+        frame_indices: Frame indices within ``episode_index`` to delete.
+        global_indices: Absolute frame indices in dataset order to delete.
+    """
+    if dataset.episodes is not None:
+        raise ValueError("delete_frames requires loading the full dataset, not a subset of episodes")
+
+    src_dataset = LeRobotDataset(
+        dataset.repo_id,
+        root=dataset.root,
+        tolerance_s=dataset.tolerance_s,
+        download_videos=False,
+        video_backend=dataset.video_backend,
+    )
+
+    frames_to_delete = _resolve_frames_to_delete(
+        src_dataset,
+        episode_index=episode_index,
+        frame_indices=frame_indices,
+        global_indices=global_indices,
+    )
+
+    return _rebuild_dataset_without_frames(
+        src_dataset,
+        frames_to_delete=frames_to_delete,
+        output_dir=output_dir,
+        repo_id=repo_id,
+    )
+
+
+def _count_trailing_static_frames(actions: torch.Tensor | np.ndarray, delta_threshold: float) -> int:
+    if len(actions) < 2:
+        return 0
+
+    action_values = actions.detach().cpu().numpy() if isinstance(actions, torch.Tensor) else np.asarray(actions)
+    action_values = action_values.astype(np.float64, copy=False).reshape(len(action_values), -1)
+    action_deltas = np.linalg.norm(np.diff(action_values, axis=0), axis=1)
+
+    trailing_static_frames = 0
+    for delta in action_deltas[::-1]:
+        if delta <= delta_threshold:
+            trailing_static_frames += 1
+        else:
+            break
+
+    return trailing_static_frames
+
+
+def _resolve_trailing_static_global_indices(
+    dataset: LeRobotDataset,
+    action_key: str = "action",
+    delta_threshold: float = 1e-6,
+    min_static_frames: int = 1,
+) -> list[int]:
+    if dataset.episodes is not None:
+        raise ValueError("trim_trailing_static_frames requires loading the full dataset, not a subset of episodes")
+    if action_key not in dataset.features:
+        raise ValueError(f"Unknown action key: {action_key}")
+    if dataset.features[action_key]["dtype"] in ["image", "video"]:
+        raise ValueError(f"Action key must be numeric, got visual feature: {action_key}")
+    if delta_threshold < 0:
+        raise ValueError("delta_threshold must be non-negative")
+    if min_static_frames < 1:
+        raise ValueError("min_static_frames must be at least 1")
+
+    global_indices: list[int] = []
+    trimmed_episode_count = 0
+
+    for ep_idx in tqdm(range(dataset.meta.total_episodes), desc="Scanning trailing static frames"):
+        ep_meta = dataset.meta.episodes[ep_idx]
+        from_idx = int(ep_meta["dataset_from_index"])
+        to_idx = int(ep_meta["dataset_to_index"])
+
+        action_batch = dataset.hf_dataset[from_idx:to_idx][action_key]
+        if len(action_batch) < 2:
+            continue
+
+        if isinstance(action_batch[0], torch.Tensor):
+            actions = torch.stack(action_batch)
+        else:
+            actions = np.stack(action_batch)
+
+        trailing_static_frames = _count_trailing_static_frames(actions, delta_threshold)
+        if trailing_static_frames < min_static_frames:
+            continue
+
+        trimmed_episode_count += 1
+        global_indices.extend(range(to_idx - trailing_static_frames, to_idx))
+
+    logging.info(
+        "Detected %s trailing static frame(s) across %s episode(s) using %s (delta_threshold=%s, min_static_frames=%s)",
+        len(global_indices),
+        trimmed_episode_count,
+        action_key,
+        delta_threshold,
+        min_static_frames,
+    )
+    return global_indices
+
+
+def trim_trailing_static_frames(
+    dataset: LeRobotDataset,
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+    action_key: str = "action",
+    delta_threshold: float = 1e-6,
+    min_static_frames: int = 1,
+) -> LeRobotDataset:
+    """Trim trailing frames whose action changes stay below a threshold.
+
+    For each episode, this keeps the first frame of the final static segment and deletes the
+    subsequent trailing frames whose L2 action delta against the previous frame is less than or
+    equal to ``delta_threshold``.
+
+    Args:
+        dataset: The source dataset. Must be the full dataset, not a subset of episodes.
+        output_dir: Directory to save the new dataset. If None, uses the default cache location.
+        repo_id: Repository ID for the new dataset. If None, appends "_trimmed" to the original repo id.
+        action_key: Numeric feature used to detect static tails. Defaults to ``action``.
+        delta_threshold: Maximum per-frame L2 action delta considered static.
+        min_static_frames: Minimum number of trailing frames to delete for an episode to be trimmed.
+    """
+    global_indices = _resolve_trailing_static_global_indices(
+        dataset,
+        action_key=action_key,
+        delta_threshold=delta_threshold,
+        min_static_frames=min_static_frames,
+    )
+    if not global_indices:
+        raise ValueError("No trailing static frames matched the configured action threshold")
+
+    if repo_id is None:
+        repo_id = f"{dataset.repo_id}_trimmed"
+
+    return delete_frames(
+        dataset,
+        output_dir=output_dir,
+        repo_id=repo_id,
+        global_indices=global_indices,
+    )
+
+
+def find_trailing_static_frame_indices(
+    dataset: LeRobotDataset,
+    action_key: str = "action",
+    delta_threshold: float = 0.0,
+    keep_last_n: int = 1,
+    min_tail_length: int = 2,
+) -> dict[int, list[int]]:
+    """Find global frame indices belonging to trailing static tails in each episode.
+
+    A trailing static tail is defined as the final contiguous suffix of an episode where the
+    L2 distance between consecutive ``action_key`` values is below or equal to ``delta_threshold``.
+    The earliest ``keep_last_n`` frames of that suffix are preserved, and the rest are returned as
+    global dataset indices to delete.
+
+    Args:
+        dataset: The source dataset. Must be the full dataset, not an episode subset.
+        action_key: Feature name used to detect static tails.
+        delta_threshold: Maximum allowed L2 delta between consecutive actions inside the tail.
+        keep_last_n: Number of frames to preserve at the beginning of the static suffix.
+        min_tail_length: Minimum detected suffix length before trimming is applied.
+
+    Returns:
+        Mapping from episode index to sorted global indices to delete.
+    """
+    if dataset.episodes is not None:
+        raise ValueError("find_trailing_static_frame_indices requires loading the full dataset")
+    if action_key not in dataset.meta.features:
+        raise ValueError(f"Feature '{action_key}' not found in dataset")
+    if delta_threshold < 0:
+        raise ValueError("delta_threshold must be >= 0")
+    if keep_last_n < 0:
+        raise ValueError("keep_last_n must be >= 0")
+    if min_tail_length < 1:
+        raise ValueError("min_tail_length must be >= 1")
+
+    episodes_by_file: dict[Path, list[int]] = {}
+    for ep_idx in range(dataset.meta.total_episodes):
+        data_path = dataset.root / dataset.meta.get_data_file_path(ep_idx)
+        episodes_by_file.setdefault(data_path, []).append(ep_idx)
+
+    frames_to_delete: dict[int, list[int]] = {}
+    columns = ["episode_index", "frame_index", "index", action_key]
+
+    for data_path, episode_indices in episodes_by_file.items():
+        file_df = pd.read_parquet(data_path, columns=columns)
+
+        for ep_idx in episode_indices:
+            ep_df = file_df[file_df["episode_index"] == ep_idx].sort_values("frame_index")
+            if len(ep_df) <= keep_last_n:
+                continue
+
+            actions = np.stack(ep_df[action_key].map(np.asarray).to_list())
+            tail_length = 1
+
+            for frame_idx in range(len(actions) - 1, 0, -1):
+                delta = float(np.linalg.norm(actions[frame_idx] - actions[frame_idx - 1]))
+                if delta <= delta_threshold:
+                    tail_length += 1
+                else:
+                    break
+
+            if tail_length < min_tail_length:
+                continue
+
+            delete_count = tail_length - keep_last_n
+            if delete_count <= 0:
+                continue
+
+            frames_to_delete[ep_idx] = ep_df["index"].iloc[-delete_count:].astype(int).tolist()
+
+    return frames_to_delete
 
 
 def split_dataset(
