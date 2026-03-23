@@ -15,11 +15,14 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+import warnings
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
+
+GROOT_ACTION_CHUNK_SIZE = 16
 
 
 @PreTrainedConfig.register_subclass("groot")
@@ -29,8 +32,11 @@ class GrootConfig(PreTrainedConfig):
 
     # Basic policy settings
     n_obs_steps: int = 1
-    chunk_size: int = 50
-    n_action_steps: int = 50
+    # GR00T N1.5 exposes a fixed 16-step action horizon publicly. Keep `chunk_size`
+    # for config compatibility, but resolve runtime chunk usage through
+    # `action_chunk_size`.
+    chunk_size: int = GROOT_ACTION_CHUNK_SIZE
+    n_action_steps: int = GROOT_ACTION_CHUNK_SIZE
 
     # Dimension settings (must match pretrained GR00T model expectations)
     # Maximum state dimension. Shorter states will be zero-padded.
@@ -120,9 +126,15 @@ class GrootConfig(PreTrainedConfig):
     def __post_init__(self):
         super().__post_init__()
 
-        if self.n_action_steps > self.chunk_size:
-            raise ValueError(
-                f"n_action_steps ({self.n_action_steps}) cannot exceed chunk_size ({self.chunk_size})"
+        if self.n_action_steps > self.action_chunk_size:
+            legacy_steps = self.n_action_steps
+            self.n_action_steps = self.action_chunk_size
+            warnings.warn(
+                "n_action_steps "
+                f"({legacy_steps}) exceeds GR00T action_chunk_size ({self.action_chunk_size}); "
+                f"clamping inference horizon to {self.n_action_steps} for compatibility with the public "
+                "16-step GR00T action head.",
+                stacklevel=2,
             )
 
         # groot_repo_path is now optional since we ported the components
@@ -191,9 +203,19 @@ class GrootConfig(PreTrainedConfig):
         return None
 
     @property
+    def action_chunk_size(self) -> int:
+        """Return the fixed GR00T action horizon exposed to external callers."""
+        return GROOT_ACTION_CHUNK_SIZE
+
+    @property
+    def n_action_steps_effective(self) -> int:
+        """Return the number of action steps the wrapper can serve from one GR00T chunk."""
+        return min(self.n_action_steps, self.action_chunk_size)
+
+    @property
     def action_delta_indices(self) -> list[int]:
         """Return indices for delta actions."""
-        return list(range(min(self.chunk_size, 16)))
+        return list(range(self.action_chunk_size))
 
     @property
     def reward_delta_indices(self) -> None:

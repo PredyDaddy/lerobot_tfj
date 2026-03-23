@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from pathlib import Path
+from typing import Any
 
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
@@ -32,6 +33,7 @@ from lerobot.utils.constants import (
     TRAINING_STEP,
 )
 from lerobot.utils.random_utils import load_rng_state, save_rng_state
+from lerobot.utils.train_metadata import as_kd_teacher_metadata, save_kd_teacher_metadata
 
 
 def get_step_identifier(step: int, total_steps: int) -> str:
@@ -71,6 +73,7 @@ def save_checkpoint(
     scheduler: LRScheduler | None = None,
     preprocessor: PolicyProcessorPipeline | None = None,
     postprocessor: PolicyProcessorPipeline | None = None,
+    teacher_metadata: dict[str, Any] | None = None,
 ) -> None:
     """This function creates the following directory structure:
 
@@ -81,6 +84,7 @@ def save_checkpoint(
     │   ├── train_config.json  # train config
     │   ├── processor.json  # processor config (if preprocessor provided)
     │   └── step_*.safetensors  # processor state files (if any)
+    ├── kd_teacher_metadata.json  # teacher provenance snapshot (if KD metadata is available)
     └── training_state/
         ├── optimizer_param_groups.json  #  optimizer param groups
         ├── optimizer_state.safetensors  # optimizer state
@@ -103,6 +107,13 @@ def save_checkpoint(
         preprocessor.save_pretrained(pretrained_dir)
     if postprocessor is not None:
         postprocessor.save_pretrained(pretrained_dir)
+
+    if teacher_metadata is None and hasattr(cfg, "__dict__"):
+        teacher_metadata = cfg.__dict__.get("kd_teacher_metadata")
+    normalized_teacher_metadata = as_kd_teacher_metadata(teacher_metadata)
+    if normalized_teacher_metadata is not None:
+        save_kd_teacher_metadata(normalized_teacher_metadata, checkpoint_dir)
+
     save_training_state(checkpoint_dir, step, optimizer, scheduler)
 
 

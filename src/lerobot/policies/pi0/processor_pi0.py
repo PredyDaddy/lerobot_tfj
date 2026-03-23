@@ -35,6 +35,7 @@ from lerobot.processor import (
 )
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+from lerobot.utils.pi_compat import resolve_paligemma_tokenizer_source
 
 
 @ProcessorStepRegistry.register(name="pi0_new_line_processor")
@@ -125,6 +126,7 @@ def make_pi0_pre_post_processors(
     Returns:
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
+    tokenizer_source = resolve_paligemma_tokenizer_source()
 
     # Add remaining processors
     input_steps: list[ProcessorStep] = [
@@ -132,7 +134,7 @@ def make_pi0_pre_post_processors(
         AddBatchDimensionProcessorStep(),
         Pi0NewLineProcessor(),  # Add newlines before tokenization for PaliGemma
         TokenizerProcessorStep(
-            tokenizer_name="google/paligemma-3b-pt-224",
+            tokenizer_name=tokenizer_source,
             max_length=config.tokenizer_max_length,
             padding_side="right",
             padding="max_length",

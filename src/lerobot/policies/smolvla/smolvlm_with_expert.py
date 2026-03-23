@@ -16,13 +16,15 @@ import copy
 
 import torch
 from torch import nn
-from transformers import (
-    AutoConfig,
-    AutoModel,
-    AutoModelForImageTextToText,
-    AutoProcessor,
-    SmolVLMForConditionalGeneration,
-)
+
+from lerobot.utils.import_utils import import_transformers_module
+
+_transformers = import_transformers_module()
+AutoConfig = _transformers.AutoConfig
+AutoModel = _transformers.AutoModel
+AutoModelForImageTextToText = _transformers.AutoModelForImageTextToText
+AutoProcessor = _transformers.AutoProcessor
+SmolVLMForConditionalGeneration = _transformers.SmolVLMForConditionalGeneration
 
 
 def apply_rope(x, positions, max_wavelength=10_000):
@@ -80,12 +82,13 @@ class SmolVLMWithExpertModel(nn.Module):
                 device_map=device,
                 torch_dtype="bfloat16",
                 low_cpu_mem_usage=True,
+                local_files_only=True,
             )
             config = self.vlm.config
         else:
-            config = AutoConfig.from_pretrained(model_id)
+            config = AutoConfig.from_pretrained(model_id, local_files_only=True)
             self.vlm = SmolVLMForConditionalGeneration(config=config)
-        self.processor = AutoProcessor.from_pretrained(model_id)
+        self.processor = AutoProcessor.from_pretrained(model_id, local_files_only=True)
         if num_vlm_layers > 0:
             print(f"Reducing the number of VLM layers to {num_vlm_layers} ...")
             self.get_vlm_model().text_model.layers = self.get_vlm_model().text_model.layers[:num_vlm_layers]

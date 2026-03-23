@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -30,11 +32,6 @@ else:
     AutoProcessor = None
     ProcessorMixin = object
 
-from lerobot.configs.types import (
-    FeatureType,
-    NormalizationMode,
-    PolicyFeature,
-)
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
@@ -58,6 +55,27 @@ from lerobot.utils.constants import (
 
 # Defaults for Eagle processor locations
 DEFAULT_TOKENIZER_ASSETS_REPO = "lerobot/eagle2hg-processor-groot-n1p5"
+GROOT_ACTION_OUTPUT_MODE_LAST_STEP = "last_step"
+GROOT_ACTION_OUTPUT_MODE_FULL_CHUNK = "full_chunk"
+_VALID_GROOT_ACTION_OUTPUT_MODES = {
+    GROOT_ACTION_OUTPUT_MODE_LAST_STEP,
+    GROOT_ACTION_OUTPUT_MODE_FULL_CHUNK,
+}
+_GROOT_SAMPLE_TIME_RESERVED_KEYS = frozenset(
+    {
+        "observation",
+        "action",
+        "action_chunk",
+        "reward",
+        "done",
+        "truncated",
+        "success",
+        "bootstrap_discount",
+        "metadata",
+        "next_observation",
+        "info",
+    }
+)
 
 
 def make_groot_pre_post_processors(
@@ -104,20 +122,6 @@ def make_groot_pre_post_processors(
     # Pass raw dataset_stats; normalization will occur inside pack step before padding
     padded_stats = dataset_stats or {}
 
-    # Define feature specs for optional normalization steps
-    _features: dict[str, PolicyFeature] = {
-        # Observation features (only add those we may normalize)
-        "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(state_horizon, max_state_dim)),
-        # Action feature
-        "action": PolicyFeature(type=FeatureType.ACTION, shape=(action_horizon, max_action_dim)),
-    }
-
-    # Normalize STATE and ACTION with min_max (SO100-like default)
-    _norm_map = {
-        FeatureType.ACTION: NormalizationMode.MIN_MAX,
-        FeatureType.STATE: NormalizationMode.MIN_MAX,
-    }
-
     # Determine env action dimension from config (simple, object-like PolicyFeature)
     try:
         env_action_dim = int(config.output_features["action"].shape[0])
@@ -154,12 +158,15 @@ def make_groot_pre_post_processors(
         DeviceProcessorStep(device=config.device),
     ]
 
-    # Postprocessing: slice to env action dim and unnormalize to env scale, then move to CPU
+    # Postprocessing defaults to the existing single-step behavior. Callers that need
+    # collector-friendly chunk outputs can override
+    # `groot_action_unpack_unnormalize_v1.output_mode = "full_chunk"` when loading.
     output_steps: list[ProcessorStep] = [
         GrootActionUnpackUnnormalizeStep(
             env_action_dim=env_action_dim,
             stats=padded_stats,
             normalize_min_max=True,
+            output_mode=GROOT_ACTION_OUTPUT_MODE_LAST_STEP,
         ),
         # Finally, move to CPU for env interaction
         DeviceProcessorStep(device="cpu"),
@@ -203,9 +210,85 @@ def _build_eagle_processor(tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS
             "Vendor files are copied during model creation. Create the policy/model first, "
             "or call ensure_eagle_cache_ready() before building processors."
         )
-    proc = AutoProcessor.from_pretrained(str(cache_dir), trust_remote_code=True, use_fast=True)
+    try:
+        proc = AutoProcessor.from_pretrained(str(cache_dir), trust_remote_code=True, use_fast=True)
+        image_processor = getattr(proc, "image_processor", None)
+        if image_processor is not None and hasattr(image_processor, "_prepare_image_like_inputs"):
+            proc.tokenizer.padding_side = "left"
+            return proc
+        logging.warning(
+            "[GROOT] Fast Eagle processor is incompatible with the current transformers/image processor API. "
+            "Falling back to the slow processor for runtime correctness."
+        )
+    except Exception as exc:
+        logging.warning(
+            "[GROOT] Failed to build fast Eagle processor (%s: %s). Falling back to the slow processor.",
+            type(exc).__name__,
+            exc,
+        )
+
+    proc = AutoProcessor.from_pretrained(str(cache_dir), trust_remote_code=True, use_fast=False)
     proc.tokenizer.padding_side = "left"
     return proc
+
+
+def build_groot_sample_time_batch(
+    observation: Mapping[str, Any],
+    *,
+    task: str | list[str] | None = None,
+    task_key: str = "task",
+    extra_batch_fields: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build an observation-only batch for raw-replay sample-time preprocessing.
+
+    Hybrid replay stores raw chunk transitions rather than policy-ready Eagle tensors.
+    This helper gives trainer-side code an explicit way to preprocess
+    `transition.observation` or `transition.next_observation` on demand without
+    accidentally threading RL-only fields like `action_chunk` back through the
+    standard batch-to-transition path.
+    """
+    if not isinstance(observation, Mapping):
+        raise TypeError(f"`observation` must be a mapping, got {type(observation)}")
+
+    reserved_keys = sorted(_GROOT_SAMPLE_TIME_RESERVED_KEYS.intersection(observation))
+    if reserved_keys:
+        raise ValueError(
+            "build_groot_sample_time_batch expects a raw observation mapping, not a full chunk transition. "
+            f"Unexpected keys: {reserved_keys}"
+        )
+
+    batch = dict(observation)
+    if extra_batch_fields is not None:
+        forbidden_extra_keys = sorted(_GROOT_SAMPLE_TIME_RESERVED_KEYS.intersection(extra_batch_fields))
+        if forbidden_extra_keys:
+            raise ValueError(
+                "extra_batch_fields for GROOT sample-time preprocessing may only contain observation-side "
+                f"context such as task strings. Unexpected keys: {forbidden_extra_keys}"
+            )
+        batch.update(dict(extra_batch_fields))
+
+    if task is not None:
+        batch[task_key] = task
+
+    return batch
+
+
+def preprocess_groot_sample_time_batch(
+    preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
+    observation: Mapping[str, Any],
+    *,
+    task: str | list[str] | None = None,
+    task_key: str = "task",
+    extra_batch_fields: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Preprocess a raw observation batch at replay sample time."""
+    batch = build_groot_sample_time_batch(
+        observation,
+        task=task,
+        task_key=task_key,
+        extra_batch_fields=extra_batch_fields,
+    )
+    return preprocessor(batch)
 
 
 @dataclass
@@ -572,6 +655,39 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
     # Apply inverse of min-max normalization if it was used in preprocessor
     normalize_min_max: bool = True
     stats: dict[str, dict[str, Any]] | None = None
+    output_mode: str = GROOT_ACTION_OUTPUT_MODE_LAST_STEP
+
+    def __post_init__(self) -> None:
+        if self.output_mode not in _VALID_GROOT_ACTION_OUTPUT_MODES:
+            raise ValueError(
+                f"Unsupported GROOT action output mode '{self.output_mode}'. "
+                f"Expected one of {sorted(_VALID_GROOT_ACTION_OUTPUT_MODES)}."
+            )
+
+    def _select_output_tensor(self, action: torch.Tensor) -> torch.Tensor:
+        if action.dim() != 3:
+            return action
+        if self.output_mode == GROOT_ACTION_OUTPUT_MODE_LAST_STEP:
+            return action[:, -1, :]
+        return action
+
+    def _aligned_stat_tensor(
+        self,
+        stats_k: dict[str, Any],
+        *,
+        stat_name: str,
+        action: torch.Tensor,
+        default_factory,
+    ) -> torch.Tensor:
+        action_dim = action.shape[-1]
+        stat = torch.as_tensor(
+            stats_k.get(stat_name, default_factory(action_dim)),
+            dtype=action.dtype,
+            device=action.device,
+        ).flatten()
+        if stat.numel() < action_dim:
+            stat = torch.nn.functional.pad(stat, (0, action_dim - stat.numel()))
+        return stat[:action_dim]
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         # Expect model outputs to be in TransitionKey.ACTION as (B, T, D_model)
@@ -579,10 +695,7 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
         if not isinstance(action, torch.Tensor):
             return transition
 
-        # Select last timestep and slice to env dimension
-        if action.dim() == 3:
-            action = action[:, -1, :]
-        # Now action is (B, D_model)
+        action = self._select_output_tensor(action)
         if self.env_action_dim and action.shape[-1] >= self.env_action_dim:
             action = action[..., : self.env_action_dim]
 
@@ -591,19 +704,8 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
         # inverse: x = (y+1)/2 * denom + min, and when denom==0 -> x = min
         if self.normalize_min_max and self.stats is not None:
             stats_k = self.stats.get("action", {})
-            d = action.shape[-1]
-            min_v = torch.as_tensor(
-                stats_k.get("min", torch.zeros(d)), dtype=action.dtype, device=action.device
-            )
-            max_v = torch.as_tensor(
-                stats_k.get("max", torch.ones(d)), dtype=action.dtype, device=action.device
-            )
-            if min_v.numel() != d:
-                min_v = torch.nn.functional.pad(min_v.flatten()[:d], (0, max(0, d - min_v.numel())))
-                min_v = min_v.to(action.device, dtype=action.dtype)
-            if max_v.numel() != d:
-                max_v = torch.nn.functional.pad(max_v.flatten()[:d], (0, max(0, d - max_v.numel())))
-                max_v = max_v.to(action.device, dtype=action.dtype)
+            min_v = self._aligned_stat_tensor(stats_k, stat_name="min", action=action, default_factory=torch.zeros)
+            max_v = self._aligned_stat_tensor(stats_k, stat_name="max", action=action, default_factory=torch.ones)
             denom = max_v - min_v
             mask = denom != 0
             safe_denom = torch.where(mask, denom, torch.ones_like(denom))
@@ -625,6 +727,7 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
         return {
             "env_action_dim": self.env_action_dim,
             "normalize_min_max": self.normalize_min_max,
+            "output_mode": self.output_mode,
         }
 
     def state_dict(self) -> dict[str, torch.Tensor]:

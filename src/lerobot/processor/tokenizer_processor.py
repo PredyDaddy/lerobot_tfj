@@ -29,15 +29,19 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
+from lerobot.utils.import_utils import import_transformers_module
 from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
 from lerobot.utils.import_utils import _transformers_available
+from lerobot.utils.pi_compat import PALIGEMMA_TOKENIZER_ID, resolve_paligemma_tokenizer_source
 
 from .core import EnvTransition, TransitionKey
 from .pipeline import ObservationProcessorStep, ProcessorStepRegistry
 
 # Conditional import for type checking and lazy loading
-if TYPE_CHECKING or _transformers_available:
+if TYPE_CHECKING:
     from transformers import AutoTokenizer
+elif _transformers_available:
+    AutoTokenizer = import_transformers_module().AutoTokenizer
 else:
     AutoTokenizer = None
 
@@ -99,7 +103,10 @@ class TokenizerProcessorStep(ObservationProcessorStep):
         elif self.tokenizer_name is not None:
             if AutoTokenizer is None:
                 raise ImportError("AutoTokenizer is not available")
-            self.input_tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
+            tokenizer_source = self.tokenizer_name
+            if self.tokenizer_name == PALIGEMMA_TOKENIZER_ID:
+                tokenizer_source = resolve_paligemma_tokenizer_source()
+            self.input_tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
         else:
             raise ValueError(
                 "Either 'tokenizer' or 'tokenizer_name' must be provided. "

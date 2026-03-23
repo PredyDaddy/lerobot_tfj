@@ -126,11 +126,30 @@ def are_all_envs_same_type(env: gym.vector.VectorEnv) -> bool:
     return all(type(e) is first_type for e in env.envs)  # Fast type check
 
 
+def _unwrap_env_attr(env: Any, attr_name: str) -> bool:
+    """Check whether an attribute exists on an env or one of its wrappers."""
+    current = env
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if hasattr(current, attr_name):
+            return True
+        if hasattr(current, "env"):
+            current = current.env
+            continue
+        unwrapped = getattr(current, "unwrapped", None)
+        if unwrapped is not None and unwrapped is not current:
+            current = unwrapped
+            continue
+        current = None
+    return False
+
+
 def check_env_attributes_and_types(env: gym.vector.VectorEnv) -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("once", UserWarning)  # Apply filter only in this function
 
-        if not (hasattr(env.envs[0], "task_description") and hasattr(env.envs[0], "task")):
+        if not (_unwrap_env_attr(env.envs[0], "task_description") and _unwrap_env_attr(env.envs[0], "task")):
             warnings.warn(
                 "The environment does not have 'task_description' and 'task'. Some policies require these features.",
                 UserWarning,
@@ -146,7 +165,7 @@ def check_env_attributes_and_types(env: gym.vector.VectorEnv) -> None:
 
 def add_envs_task(env: gym.vector.VectorEnv, observation: dict[str, Any]) -> dict[str, Any]:
     """Adds task feature to the observation dict with respect to the first environment attribute."""
-    if hasattr(env.envs[0], "task_description"):
+    if _unwrap_env_attr(env.envs[0], "task_description"):
         task_result = env.call("task_description")
 
         if isinstance(task_result, tuple):
@@ -158,7 +177,7 @@ def add_envs_task(env: gym.vector.VectorEnv, observation: dict[str, Any]) -> dic
             raise TypeError("All items in task_description result must be strings")
 
         observation["task"] = task_result
-    elif hasattr(env.envs[0], "task"):
+    elif _unwrap_env_attr(env.envs[0], "task"):
         task_result = env.call("task")
 
         if isinstance(task_result, tuple):

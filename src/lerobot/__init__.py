@@ -45,6 +45,22 @@ When implementing a new policy class (e.g. `DiffusionPolicy`) follow these steps
 """
 
 import itertools
+from pathlib import Path
+
+
+def _extend_local_overlay_paths() -> None:
+    """Expose local TFJ overlay modules under the main `lerobot` package."""
+    project_root = Path(__file__).resolve().parents[2]
+    overlay_dirs = [
+        project_root / "tfj_envs/so101_control_pause_20260319/src/lerobot",
+    ]
+    for overlay_dir in overlay_dirs:
+        overlay_str = str(overlay_dir)
+        if overlay_dir.is_dir() and overlay_str not in __path__:
+            __path__.append(overlay_str)
+
+
+_extend_local_overlay_paths()
 
 from lerobot.__version__ import __version__  # noqa: F401
 

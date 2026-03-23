@@ -15,8 +15,9 @@
 # limitations under the License.
 
 import pytest
+import torch
 
-from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
+from lerobot.utils.logging_utils import AverageMeter, MetricsTracker, reduce_metrics_dict
 
 
 @pytest.fixture
@@ -82,6 +83,25 @@ def test_metrics_tracker_step(mock_metrics):
     assert tracker.epochs == tracker.samples / 1000
 
 
+def test_metrics_tracker_step_does_not_double_count_world_size(mock_metrics):
+    accelerator = type("FakeAccelerator", (), {"num_processes": 4})()
+    tracker = MetricsTracker(
+        batch_size=128,
+        num_frames=1000,
+        num_episodes=50,
+        metrics=mock_metrics,
+        initial_step=0,
+        accelerator=accelerator,
+    )
+
+    tracker.step()
+
+    assert tracker.steps == 1
+    assert tracker.samples == 128
+    assert tracker.episodes == tracker.samples / (1000 / 50)
+    assert tracker.epochs == tracker.samples / 1000
+
+
 def test_metrics_tracker_getattr(mock_metrics):
     tracker = MetricsTracker(batch_size=32, num_frames=1000, num_episodes=50, metrics=mock_metrics)
     assert tracker.loss == mock_metrics["loss"]
@@ -121,3 +141,42 @@ def test_metrics_tracker_reset_averages(mock_metrics):
     tracker.reset_averages()
     assert tracker.loss.avg == 0.0
     assert tracker.accuracy.avg == 0.0
+
+
+def test_metrics_tracker_register_metrics():
+    tracker = MetricsTracker(batch_size=32, num_frames=1000, num_episodes=50, metrics={})
+    tracker.register_metrics({"kd_l1_loss": AverageMeter("kd", ":.3f")})
+    tracker.kd_l1_loss = 1.5
+    assert tracker.kd_l1_loss.avg == 1.5
+
+    with pytest.raises(ValueError, match="already registered"):
+        tracker.register_metrics({"kd_l1_loss": AverageMeter("kd", ":.3f")})
+
+
+def test_metrics_tracker_update_from_dict(mock_metrics):
+    tracker = MetricsTracker(batch_size=32, num_frames=1000, num_episodes=50, metrics=mock_metrics)
+    tracker.register_metrics({"kd_l1_loss": AverageMeter("kd", ":.3f")})
+    tracker.update_from_dict({"loss": 2.0, "kd_l1_loss": torch.tensor(1.25)})
+    assert tracker.loss.avg == 2.0
+    assert tracker.kd_l1_loss.avg == 1.25
+
+
+def test_reduce_metrics_dict_uses_accelerator():
+    class FakeAccelerator:
+        def __init__(self):
+            self.device = torch.device("cpu")
+            self.calls = []
+
+        def reduce(self, tensor, reduction="sum"):
+            self.calls.append((tensor.item(), reduction))
+            return tensor + 1.0
+
+    accelerator = FakeAccelerator()
+    reduced = reduce_metrics_dict(
+        {"kd_l1_loss": 1.0, "kd_overlap_steps": torch.tensor(4.0), "ignored": [1, 2, 3]},
+        accelerator=accelerator,
+        reduction="mean",
+    )
+
+    assert reduced == {"kd_l1_loss": 2.0, "kd_overlap_steps": 5.0}
+    assert accelerator.calls == [(1.0, "mean"), (4.0, "mean")]

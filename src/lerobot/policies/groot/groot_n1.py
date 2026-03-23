@@ -166,6 +166,7 @@ class EagleBackbone(nn.Module):
 
 
 BACKBONE_FEATURE_KEY = "backbone_features"
+BACKBONE_ATTENTION_MASK_KEY = "backbone_attention_mask"
 ACTION_KEY = "action_pred"
 LOSS_KEY = "loss"
 ERROR_MSG = "Error: unexpected input/output"
@@ -233,12 +234,9 @@ class GR00TN15(PreTrainedModel):
             if action is None:
                 pass  # allow None during inference
             elif isinstance(action, torch.Tensor):
-                shape_ok = (
-                    len(action.shape) == 3
-                    and action.shape[1] == self.action_horizon
-                    and action.shape[2] == self.action_dim
-                )
-                if not shape_ok:
+                rank_ok = len(action.shape) in (2, 3)
+                feature_ok = action.shape[-1] > 0
+                if not rank_ok or not feature_ok:
                     error_msg += f"\n{action.shape=}"
                     detected_error = True
             else:
@@ -296,48 +294,163 @@ class GR00TN15(PreTrainedModel):
             error_msg += f"\n{self.action_dim=}"
             raise ValueError(error_msg)
 
-    def forward(
+    def _to_device_with_maybe_dtype(self, x):
+        # Cast floating tensors to a memory-efficient compute dtype when requested.
+        # Rationale: Upcasting backbone activations to fp32 significantly increases VRAM.
+        # When compute_dtype is bfloat16, prefer bf16 for activations to match AMP behavior.
+        if not isinstance(x, torch.Tensor):
+            return x
+        if torch.is_floating_point(x):
+            if getattr(self, "compute_dtype", None) == "bfloat16":
+                return x.to(self.device, dtype=torch.bfloat16)
+            # Fallback: preserve previous behavior if not using bf16 compute
+            return x.to(self.device, dtype=self.action_head.dtype)
+        # Non-floating tensors: move device only
+        return x.to(self.device)
+
+    def _backbone_outputs_from_context(self, context: BatchFeature) -> BatchFeature:
+        backbone_output = {BACKBONE_FEATURE_KEY: context[BACKBONE_FEATURE_KEY]}
+        if BACKBONE_ATTENTION_MASK_KEY in context:
+            backbone_output[BACKBONE_ATTENTION_MASK_KEY] = context[BACKBONE_ATTENTION_MASK_KEY]
+        return BatchFeature(data=backbone_output)
+
+    def _pool_context_tensor(
+        self,
+        features: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if features.ndim == 2:
+            return features.to(dtype=torch.float32)
+        if features.ndim != 3:
+            raise ValueError(
+                "Expected context features to have shape `(batch, tokens, dim)` or `(batch, dim)`, "
+                f"got shape={tuple(features.shape)}."
+            )
+
+        if mask is None:
+            return features.mean(dim=1).to(dtype=torch.float32)
+
+        if mask.ndim == 3:
+            mask = mask.any(dim=-1)
+        elif mask.ndim == 1:
+            mask = mask.unsqueeze(1)
+        elif mask.ndim != 2:
+            raise ValueError(
+                "Expected context mask to have shape `(batch, tokens)` or `(batch, tokens, dim)`, "
+                f"got shape={tuple(mask.shape)}."
+            )
+
+        if mask.shape[0] != features.shape[0] or mask.shape[1] != features.shape[1]:
+            raise ValueError(
+                "Context mask batch/token dimensions must match features. "
+                f"Got mask shape={tuple(mask.shape)} and features shape={tuple(features.shape)}."
+            )
+
+        weights = mask.to(device=features.device, dtype=features.dtype).unsqueeze(-1)
+        weighted_sum = (features * weights).sum(dim=1)
+        normalizer = weights.sum(dim=1).clamp(min=1)
+        return (weighted_sum / normalizer).to(dtype=torch.float32)
+
+    def get_value_from_hybrid_context(self, context: BatchFeature) -> torch.Tensor:
+        pooled_terms = [
+            self._pool_context_tensor(
+                context[BACKBONE_FEATURE_KEY],
+                context.get(BACKBONE_ATTENTION_MASK_KEY),
+            ).mean(dim=-1)
+        ]
+        if "state_features" in context:
+            pooled_terms.append(self._pool_context_tensor(context["state_features"]).mean(dim=-1))
+        return torch.stack(pooled_terms, dim=0).mean(dim=0).view(-1)
+
+    def get_value_from_context(self, context: BatchFeature) -> torch.Tensor:
+        return self.get_value_from_hybrid_context(context)
+
+    def get_hybrid_context(
         self,
         inputs: dict,
     ) -> BatchFeature:
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         backbone_outputs = self.backbone(backbone_inputs)
-        action_head_outputs = self.action_head(backbone_outputs, action_inputs)
-        self.validate_data(action_head_outputs, backbone_outputs, is_training=True)
+        return self.action_head.build_context(backbone_outputs, action_inputs)
+
+    def forward_action_chunk(
+        self,
+        context: BatchFeature,
+        *,
+        actions: torch.Tensor,
+        action_mask: torch.Tensor | None = None,
+        noise: torch.Tensor | None = None,
+        timesteps: torch.Tensor | None = None,
+    ) -> BatchFeature:
+        return self.action_head.forward_chunk(
+            context,
+            actions=self._to_device_with_maybe_dtype(actions),
+            action_mask=self._to_device_with_maybe_dtype(action_mask),
+            noise=self._to_device_with_maybe_dtype(noise),
+            timesteps=self._to_device_with_maybe_dtype(timesteps),
+        )
+
+    def predict_action_chunk_from_context(
+        self,
+        context: BatchFeature,
+        *,
+        noise: torch.Tensor | None = None,
+        num_inference_timesteps: int | None = None,
+    ) -> BatchFeature:
+        return self.action_head.sample_actions_from_context(
+            context,
+            noise=self._to_device_with_maybe_dtype(noise),
+            num_inference_timesteps=num_inference_timesteps,
+        )
+
+    def forward(
+        self,
+        inputs: dict,
+    ) -> BatchFeature:
+        context = self.get_hybrid_context(inputs)
+        action_head_outputs = self.forward_action_chunk(
+            context,
+            actions=inputs["action"],
+            action_mask=inputs.get("action_mask"),
+        )
+        self.validate_data(action_head_outputs, self._backbone_outputs_from_context(context), is_training=True)
         return action_head_outputs
 
     def get_action(
         self,
         inputs: dict,
     ) -> BatchFeature:
-        backbone_inputs, action_inputs = self.prepare_input(inputs)
-        # Because the behavior of backbones remains the same for training and inference, we can use `forward` for backbones.
-        backbone_outputs = self.backbone(backbone_inputs)
-        action_head_outputs = self.action_head.get_action(backbone_outputs, action_inputs)
-        self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
+        context = self.get_hybrid_context(inputs)
+        action_head_outputs = self.predict_action_chunk_from_context(context)
+        self.validate_data(action_head_outputs, self._backbone_outputs_from_context(context), is_training=False)
         return action_head_outputs
+
+    def get_value(
+        self,
+        inputs: dict,
+    ) -> torch.Tensor:
+        context = self.get_hybrid_context(inputs)
+        return self.get_value_from_hybrid_context(context)
+
+    def predict_value(
+        self,
+        inputs: dict,
+    ) -> torch.Tensor:
+        return self.get_value(inputs)
+
+    def value(
+        self,
+        inputs: dict,
+    ) -> torch.Tensor:
+        return self.get_value(inputs)
 
     def prepare_input(self, inputs) -> tuple[BatchFeature, BatchFeature]:
         self.validate_inputs(inputs)
         backbone_inputs = self.backbone.prepare_input(inputs)
         action_inputs = self.action_head.prepare_input(inputs)
 
-        def to_device_with_maybe_dtype(x):
-            # Cast floating tensors to a memory-efficient compute dtype when requested.
-            # Rationale: Upcasting backbone activations to fp32 significantly increases VRAM.
-            # When compute_dtype is bfloat16, prefer bf16 for activations to match AMP behavior.
-            if not isinstance(x, torch.Tensor):
-                return x
-            if torch.is_floating_point(x):
-                if getattr(self, "compute_dtype", None) == "bfloat16":
-                    return x.to(self.device, dtype=torch.bfloat16)
-                # Fallback: preserve previous behavior if not using bf16 compute
-                return x.to(self.device, dtype=self.action_head.dtype)
-            # Non-floating tensors: move device only
-            return x.to(self.device)
-
-        backbone_inputs = tree.map_structure(to_device_with_maybe_dtype, backbone_inputs)
-        action_inputs = tree.map_structure(to_device_with_maybe_dtype, action_inputs)
+        backbone_inputs = tree.map_structure(self._to_device_with_maybe_dtype, backbone_inputs)
+        action_inputs = tree.map_structure(self._to_device_with_maybe_dtype, action_inputs)
         return backbone_inputs, action_inputs
 
     @classmethod

@@ -59,11 +59,20 @@ lerobot-record \
 """
 
 import logging
+import numbers
+import sys
 import time
-from dataclasses import asdict, dataclass, field
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from pprint import pformat
 from typing import Any
+
+if __package__ is None or __package__ == "":
+    repo_src = Path(__file__).resolve().parents[2]
+    repo_src_str = str(repo_src)
+    if repo_src_str not in sys.path:
+        sys.path.insert(0, repo_src_str)
 
 from lerobot.cameras import (  # noqa: F401
     CameraConfig,  # noqa: F401
@@ -234,6 +243,285 @@ class RecordConfig:
 """
 
 
+def _get_runtime_state_value(runtime_state: Any, key: str, default: Any = None) -> Any:
+    if runtime_state is None:
+        return default
+    if isinstance(runtime_state, dict):
+        return runtime_state.get(key, default)
+    return getattr(runtime_state, key, default)
+
+
+def _set_runtime_state_value(runtime_state: Any, key: str, value: Any) -> None:
+    if runtime_state is None:
+        return
+    if isinstance(runtime_state, dict):
+        runtime_state[key] = value
+    else:
+        setattr(runtime_state, key, value)
+
+
+def _coerce_hook_result(result: Any) -> dict[str, Any] | None:
+    if result is None:
+        return None
+    if isinstance(result, dict):
+        return result
+    if is_dataclass(result) and not isinstance(result, type):
+        return asdict(result)
+    if hasattr(result, "__dict__"):
+        return {key: value for key, value in vars(result).items() if not key.startswith("_")}
+    return {"value": result}
+
+
+def _invoke_hook(hook: Any, method_name: str, **kwargs: Any) -> dict[str, Any] | None:
+    if hook is None:
+        return None
+
+    hook_method = getattr(hook, method_name, None)
+    if callable(hook_method):
+        return _coerce_hook_result(hook_method(**kwargs))
+
+    if callable(hook):
+        return _coerce_hook_result(hook(**kwargs))
+
+    raise TypeError(f"Hook {hook!r} does not provide `{method_name}(...)` and is not callable.")
+
+
+def _log_step_event(step_event_logger: Any, event_name: str, **payload: Any) -> None:
+    if step_event_logger is None:
+        return
+
+    specific_log_method = getattr(step_event_logger, f"log_{event_name}", None)
+    if callable(specific_log_method):
+        specific_log_method(**payload)
+        return
+
+    generic_log_method = getattr(step_event_logger, "log_event", None)
+    if callable(generic_log_method):
+        generic_log_method(event=event_name, **payload)
+        return
+
+    if callable(step_event_logger):
+        step_event_logger(event=event_name, **payload)
+        return
+
+    raise TypeError(
+        f"Step event logger {step_event_logger!r} does not provide `log_{event_name}(...)`, "
+        "`log_event(...)`, and is not callable."
+    )
+
+
+def _merge_action_delta(robot_action: RobotAction, action_delta: dict[str, Any]) -> RobotAction:
+    merged_action = dict(robot_action)
+    for key, delta in action_delta.items():
+        if (
+            key in merged_action
+            and isinstance(merged_action[key], numbers.Real)
+            and isinstance(delta, numbers.Real)
+        ):
+            merged_action[key] = float(merged_action[key] + delta)
+        else:
+            merged_action[key] = delta
+    return merged_action
+
+
+_ACTION_COMMAND_FIELDS = {
+    "joint_positions",
+    "joint_deltas",
+    "cartesian_target",
+    "reference_frame",
+    "gripper_closed",
+    "label",
+    "metadata",
+}
+
+
+def _is_finite_number(value: Any) -> bool:
+    return isinstance(value, numbers.Real) and not isinstance(value, bool)
+
+
+def _normalize_guard_decision(decision: Any) -> str | None:
+    if decision is None:
+        return None
+    if hasattr(decision, "value"):
+        decision = decision.value
+    if isinstance(decision, str):
+        normalized = decision.strip().lower()
+        return normalized or None
+    return None
+
+
+def _get_action_reference_keys(
+    action_template: Mapping[str, Any] | None,
+    obs: Mapping[str, Any] | None,
+) -> list[str]:
+    if action_template is not None:
+        action_keys = [key for key, value in action_template.items() if _is_finite_number(value)]
+        if action_keys:
+            return action_keys
+    if obs is not None:
+        obs_keys = [key for key, value in obs.items() if _is_finite_number(value)]
+        if obs_keys:
+            return obs_keys
+    return []
+
+
+def _is_action_command_payload(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and bool(value)
+        and set(value).issubset(_ACTION_COMMAND_FIELDS)
+        and any(field in value for field in ("joint_positions", "joint_deltas", "cartesian_target", "gripper_closed"))
+    )
+
+
+def _convert_action_command_payload(
+    command: Mapping[str, Any],
+    *,
+    action_template: Mapping[str, Any] | None,
+    obs: Mapping[str, Any] | None,
+) -> RobotAction:
+    action_keys = _get_action_reference_keys(action_template, obs)
+    obs_numeric = {
+        key: float(value)
+        for key, value in (obs.items() if obs is not None else [])
+        if _is_finite_number(value)
+    }
+
+    joint_positions = command.get("joint_positions")
+    if joint_positions is not None:
+        positions = tuple(float(value) for value in joint_positions)
+        if not action_keys:
+            raise ValueError("Cannot map GuardResult joint_positions without numeric robot action or observation keys.")
+        if len(positions) != len(action_keys):
+            raise ValueError(
+                f"GuardResult joint_positions length {len(positions)} does not match robot action dimension {len(action_keys)}."
+            )
+        return dict(zip(action_keys, positions, strict=True))
+
+    joint_deltas = command.get("joint_deltas")
+    if joint_deltas is not None:
+        deltas = tuple(float(value) for value in joint_deltas)
+        if not action_keys:
+            raise ValueError("Cannot map GuardResult joint_deltas without numeric robot action or observation keys.")
+        if len(deltas) != len(action_keys):
+            raise ValueError(
+                f"GuardResult joint_deltas length {len(deltas)} does not match robot action dimension {len(action_keys)}."
+            )
+        missing_keys = [key for key in action_keys if key not in obs_numeric]
+        if missing_keys:
+            raise ValueError(
+                "Cannot map GuardResult joint_deltas without numeric observation values for "
+                f"{missing_keys!r}."
+            )
+        return {
+            key: obs_numeric[key] + delta for key, delta in zip(action_keys, deltas, strict=True)
+        }
+
+    if command.get("gripper_closed") is not None:
+        gripper_keys = [key for key in action_keys if "gripper" in key.lower()]
+        if len(gripper_keys) == 1:
+            return {gripper_keys[0]: float(bool(command["gripper_closed"]))}
+        raise ValueError("Cannot map GuardResult gripper_closed without a single gripper-like action key.")
+
+    if command.get("cartesian_target") is not None:
+        raise ValueError("Cannot map GuardResult cartesian_target into a generic robot action dict.")
+
+    return {}
+
+
+def _coerce_robot_action_candidate(
+    candidate: Any,
+    *,
+    action_template: Mapping[str, Any] | None,
+    obs: Mapping[str, Any] | None,
+) -> RobotAction | None:
+    if candidate is None:
+        return None
+
+    if _is_action_command_payload(candidate):
+        return _convert_action_command_payload(candidate, action_template=action_template, obs=obs)
+
+    if isinstance(candidate, Mapping):
+        return dict(candidate)
+
+    if is_dataclass(candidate) and not isinstance(candidate, type):
+        candidate_payload = asdict(candidate)
+        if _is_action_command_payload(candidate_payload):
+            return _convert_action_command_payload(candidate_payload, action_template=action_template, obs=obs)
+        if isinstance(candidate_payload, Mapping):
+            return dict(candidate_payload)
+
+    if hasattr(candidate, "__dict__"):
+        candidate_payload = {key: value for key, value in vars(candidate).items() if not key.startswith("_")}
+        if _is_action_command_payload(candidate_payload):
+            return _convert_action_command_payload(candidate_payload, action_template=action_template, obs=obs)
+        if isinstance(candidate_payload, Mapping):
+            return dict(candidate_payload)
+
+    return candidate
+
+
+def _normalize_guard_result(
+    guard_result: Any,
+    *,
+    requested_action: Mapping[str, Any] | None,
+    obs: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    guard_payload = _coerce_hook_result(guard_result)
+    if guard_payload is None:
+        return None
+
+    action_override = _coerce_robot_action_candidate(
+        guard_payload.get("action"),
+        action_template=requested_action,
+        obs=obs,
+    )
+    fail_safe_action = _coerce_robot_action_candidate(
+        guard_payload.get("fail_safe_action"),
+        action_template=requested_action,
+        obs=obs,
+    )
+    decision = _normalize_guard_decision(guard_payload.get("decision"))
+
+    if decision is not None:
+        accept = decision in {"accept", "clamp_and_accept"}
+        halt = decision == "halt"
+        if not accept and fail_safe_action is None and action_override is not None:
+            fail_safe_action = action_override
+        if accept:
+            effective_action = requested_action if action_override is None else action_override
+        else:
+            effective_action = fail_safe_action
+    else:
+        accept = bool(guard_payload.get("accept", True))
+        halt = bool(guard_payload.get("halt", False))
+        if not accept and fail_safe_action is None and action_override is not None:
+            fail_safe_action = action_override
+        effective_action = requested_action
+        if accept and action_override is not None:
+            effective_action = action_override
+        if not accept:
+            effective_action = fail_safe_action
+
+    normalized_payload = dict(guard_payload)
+    normalized_payload["accept"] = accept
+    normalized_payload["halt"] = halt
+    if action_override is not None:
+        normalized_payload["action"] = action_override
+    if fail_safe_action is not None:
+        normalized_payload["fail_safe_action"] = fail_safe_action
+    if decision is not None:
+        normalized_payload["decision"] = decision
+
+    return {
+        "payload": normalized_payload,
+        "accept": accept,
+        "halt": halt,
+        "effective_action": effective_action,
+        "skip_action_send": effective_action is None,
+    }
+
+
 @safe_stop_image_writer
 def record_loop(
     robot: Robot,
@@ -253,9 +541,15 @@ def record_loop(
     policy: PreTrainedPolicy | None = None,
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None,
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None,
+    policy_observation_features: dict[str, dict] | None = None,
+    policy_action_features: dict[str, dict] | None = None,
     control_time_s: int | None = None,
     single_task: str | None = None,
     display_data: bool = False,
+    perception_bridge: Any | None = None,
+    safety_guard: Any | None = None,
+    step_event_logger: Any | None = None,
+    runtime_state: Any | None = None,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -286,10 +580,18 @@ def record_loop(
         preprocessor.reset()
         postprocessor.reset()
 
+    step_index = _get_runtime_state_value(runtime_state, "step_index", 0)
     timestamp = 0
     start_episode_t = time.perf_counter()
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
+        current_task = single_task
+        bridge_decision = None
+        guard_result = None
+        sent_action = None
+        persisted_action = None
+        halt_requested = False
+        skip_action_send = False
 
         if events["exit_early"]:
             events["exit_early"] = False
@@ -301,23 +603,55 @@ def record_loop(
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
         obs_processed = robot_observation_processor(obs)
 
-        if policy is not None or dataset is not None:
-            observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
+        if perception_bridge is not None:
+            bridge_decision = _invoke_hook(
+                perception_bridge,
+                "decide",
+                obs=obs_processed,
+                raw_obs=obs,
+                runtime_state=runtime_state,
+                task=current_task,
+                step_index=step_index,
+                timestamp=timestamp,
+            )
+            if bridge_decision and bridge_decision.get("task_override"):
+                current_task = bridge_decision["task_override"]
+
+        policy_observation_frame = None
+        dataset_observation_frame = None
+        if policy is not None:
+            observation_features = (
+                policy_observation_features
+                if policy_observation_features is not None
+                else (dataset.features if dataset is not None else None)
+            )
+            if observation_features is None:
+                raise ValueError("Policy observation features are required when running a policy.")
+            policy_observation_frame = build_dataset_frame(observation_features, obs_processed, prefix=OBS_STR)
+
+        if dataset is not None:
+            dataset_observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
 
         # Get action from either policy or teleop
         if policy is not None and preprocessor is not None and postprocessor is not None:
             action_values = predict_action(
-                observation=observation_frame,
+                observation=policy_observation_frame,
                 policy=policy,
                 device=get_safe_torch_device(policy.config.device),
                 preprocessor=preprocessor,
                 postprocessor=postprocessor,
                 use_amp=policy.config.use_amp,
-                task=single_task,
+                task=current_task,
                 robot_type=robot.robot_type,
             )
-
-            act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
+            action_features = (
+                policy_action_features
+                if policy_action_features is not None
+                else (dataset.features if dataset is not None else None)
+            )
+            if action_features is None:
+                raise ValueError("Policy action features are required when running a policy.")
+            act_processed_policy = make_robot_action(action_values, action_features)
 
         elif policy is None and isinstance(teleop, Teleoperator):
             act = teleop.get_action()
@@ -348,29 +682,108 @@ def record_loop(
             action_values = act_processed_teleop
             robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
 
+        if bridge_decision:
+            action_override = bridge_decision.get("action")
+            if action_override is not None:
+                robot_action_to_send = _coerce_robot_action_candidate(
+                    action_override,
+                    action_template=robot_action_to_send,
+                    obs=obs_processed,
+                )
+            action_delta = bridge_decision.get("action_delta")
+            if action_delta:
+                robot_action_to_send = _merge_action_delta(robot_action_to_send, action_delta)
+
+        if safety_guard is not None:
+            requested_action = robot_action_to_send
+            raw_guard_result = _invoke_hook(
+                safety_guard,
+                "validate",
+                action=robot_action_to_send,
+                obs=obs_processed,
+                raw_obs=obs,
+                runtime_state=runtime_state,
+                task=current_task,
+                bridge_decision=bridge_decision,
+                step_index=step_index,
+                timestamp=timestamp,
+            )
+            guard_result = _normalize_guard_result(
+                raw_guard_result,
+                requested_action=robot_action_to_send,
+                obs=obs_processed,
+            )
+            if guard_result is not None:
+                robot_action_to_send = guard_result["effective_action"]
+            if guard_result and not guard_result["accept"]:
+                skip_action_send = guard_result["skip_action_send"]
+                halt_requested = guard_result["halt"]
+                if halt_requested:
+                    events["stop_recording"] = True
+                    _set_runtime_state_value(runtime_state, "halted", True)
+                _log_step_event(
+                    step_event_logger,
+                    "guard_reject",
+                    step_index=step_index,
+                    task=current_task,
+                    action=robot_action_to_send,
+                    requested_action=requested_action,
+                    obs=obs_processed,
+                    raw_obs=obs,
+                    bridge_decision=bridge_decision,
+                    guard_result=guard_result["payload"],
+                    halt=halt_requested,
+                )
+
         # Send action to robot
         # Action can eventually be clipped using `max_relative_target`,
         # so action actually sent is saved in the dataset. action = postprocessor.process(action)
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
-        _sent_action = robot.send_action(robot_action_to_send)
+        if not skip_action_send:
+            sent_action = robot.send_action(robot_action_to_send)
+            persisted_action = robot_action_to_send if sent_action is None else sent_action
+            _log_step_event(
+                step_event_logger,
+                "step",
+                step_index=step_index,
+                task=current_task,
+                action=robot_action_to_send,
+                sent_action=sent_action,
+                obs=obs_processed,
+                raw_obs=obs,
+                bridge_decision=bridge_decision,
+                guard_result=None if guard_result is None else guard_result["payload"],
+            )
 
         # Write to dataset
-        if dataset is not None:
-            action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
-            frame = {**observation_frame, **action_frame, "task": single_task}
+        if dataset is not None and persisted_action is not None:
+            action_frame = build_dataset_frame(dataset.features, persisted_action, prefix=ACTION)
+            frame = {**dataset_observation_frame, **action_frame, "task": current_task}
             dataset.add_frame(frame)
 
         if display_data:
-            log_rerun_data(observation=obs_processed, action=action_values)
+            log_rerun_data(observation=obs_processed, action=action_values if persisted_action is None else persisted_action)
 
         dt_s = time.perf_counter() - start_loop_t
         precise_sleep(1 / fps - dt_s)
 
         timestamp = time.perf_counter() - start_episode_t
+        step_index += 1
+        _set_runtime_state_value(runtime_state, "step_index", step_index)
+
+        if halt_requested:
+            break
 
 
 @parser.wrap()
-def record(cfg: RecordConfig) -> LeRobotDataset:
+def record(
+    cfg: RecordConfig,
+    *,
+    perception_bridge: Any | None = None,
+    safety_guard: Any | None = None,
+    step_event_logger: Any | None = None,
+    runtime_state: Any | None = None,
+) -> LeRobotDataset:
     init_logging()
     logging.info(pformat(asdict(cfg)))
     if cfg.display_data:
@@ -394,6 +807,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             initial_features=create_initial_features(observation=robot.observation_features),
             use_videos=cfg.dataset.video,
         ),
+    )
+    policy_observation_features = aggregate_pipeline_dataset_features(
+        pipeline=robot_observation_processor,
+        initial_features=create_initial_features(observation=robot.observation_features),
+        use_videos=True,
     )
 
     if cfg.resume:
@@ -464,10 +882,15 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 policy=policy,
                 preprocessor=preprocessor,
                 postprocessor=postprocessor,
+                policy_observation_features=policy_observation_features,
                 dataset=dataset,
                 control_time_s=cfg.dataset.episode_time_s,
                 single_task=cfg.dataset.single_task,
                 display_data=cfg.display_data,
+                perception_bridge=perception_bridge,
+                safety_guard=safety_guard,
+                step_event_logger=step_event_logger,
+                runtime_state=runtime_state,
             )
 
             # Execute a few seconds without recording to give time to manually reset the environment
@@ -487,6 +910,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     control_time_s=cfg.dataset.reset_time_s,
                     single_task=cfg.dataset.single_task,
                     display_data=cfg.display_data,
+                    perception_bridge=perception_bridge,
+                    safety_guard=safety_guard,
+                    step_event_logger=step_event_logger,
+                    runtime_state=runtime_state,
                 )
 
             if events["rerecord_episode"]:

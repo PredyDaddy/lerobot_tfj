@@ -16,6 +16,8 @@
 import logging
 import time
 from contextlib import nullcontext
+from datetime import datetime, timezone
+from pathlib import Path
 from pprint import pformat
 from typing import Any
 
@@ -32,12 +34,21 @@ from lerobot.datasets.utils import cycle
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.envs.utils import close_envs
 from lerobot.optim.factory import make_optimizer_and_scheduler
+from lerobot.policies.act.distillation_utils import load_act_teacher_bundle
+from lerobot.policies.act.modeling_act import _resolve_teacher_pretrained_path
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.processor import PolicyProcessorPipeline
 from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.scripts.lerobot_eval import eval_policy_all
-from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
+from lerobot.utils.logging_utils import AverageMeter, MetricsTracker, reduce_metrics_dict
 from lerobot.utils.random_utils import set_seed
+from lerobot.utils.train_metadata import (
+    KD_TEACHER_METADATA_FILENAME,
+    KDTeacherMetadata,
+    kd_teacher_metadata_to_dict,
+    merge_kd_teacher_metadata,
+)
 from lerobot.utils.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
@@ -121,6 +132,200 @@ def update_policy(
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics, output_dict
+
+
+ACT_KD_METADATA_FILENAME = KD_TEACHER_METADATA_FILENAME
+POLICY_METRIC_SPECS = {
+    "l1_loss": ("l1", ":.3f"),
+    "kld_loss": ("kld", ":.3f"),
+    "kd_l1_loss": ("kd_raw", ":.3f"),
+    "kd_weighted_l1_loss": ("kd", ":.3f"),
+    "kd_overlap_steps": ("kd_ov", ":.1f"),
+    "kd_valid_ratio": ("kd_vr", ":.3f"),
+    "kd_to_bc_ratio": ("kd/bc", ":.3f"),
+    "kd_weighted_to_bc_ratio": ("kdw/bc", ":.3f"),
+    "kd_prefix_l1_loss": ("kd_pre", ":.3f"),
+    "kd_tail_l1_loss": ("kd_tail", ":.3f"),
+    "decoder_kd_loss": ("dec_raw", ":.3f"),
+    "decoder_kd_weighted_loss": ("dec", ":.3f"),
+    "decoder_kd_prefix_loss": ("dec_pre", ":.3f"),
+    "decoder_kd_tail_loss": ("dec_tail", ":.3f"),
+    "decoder_kd_valid_ratio": ("dec_vr", ":.3f"),
+    "decoder_kd_weighted_to_bc_ratio": ("dec/bc", ":.3f"),
+    "decoder_kd_weighted_to_action_kd_ratio": ("dec/akd", ":.3f"),
+    "decoder_prefix_to_tail_ratio": ("dec_p/t", ":.3f"),
+    "noise_to_signal_ratio": ("noise/sig", ":.3f"),
+    "decoder_grad_to_bc_grad_ratio": ("decg/bc", ":.3f"),
+    "decoder_grad_to_action_kd_grad_ratio": ("decg/akd", ":.3f"),
+    "decoder_grad_to_behavior_grad_ratio": ("decg/beh", ":.3f"),
+    "student_teacher_decoder_cos": ("dec_cos", ":.3f"),
+    "student_decoder_norm": ("s_dec_n", ":.3f"),
+    "teacher_decoder_norm": ("t_dec_n", ":.3f"),
+    "student_decoder_train_eval_gap": ("dec_gap", ":.3f"),
+}
+
+
+def _is_act_kd_training(cfg: TrainPipelineConfig) -> bool:
+    return bool(cfg.policy and cfg.policy.type == "act" and getattr(cfg.policy, "kd", False))
+
+
+def _make_policy_metric_meters(metric_names: list[str]) -> dict[str, AverageMeter]:
+    meters = {}
+    for metric_name in metric_names:
+        display_name, fmt = POLICY_METRIC_SPECS.get(metric_name, (metric_name, ":.3f"))
+        meters[metric_name] = AverageMeter(display_name, fmt)
+    return meters
+
+
+def _infer_teacher_source_kind(teacher_source: Path, teacher_pretrained_path: Path) -> str:
+    if teacher_source.is_file():
+        if teacher_source.name == "train_config.json":
+            return "train_config_file"
+        if teacher_source.name == "config.json":
+            return "config_file"
+        return "file"
+
+    if teacher_source == teacher_pretrained_path:
+        return "pretrained_dir"
+    if teacher_source / "pretrained_model" == teacher_pretrained_path:
+        return "checkpoint_dir"
+    if (teacher_source / "checkpoints").is_dir():
+        if (teacher_source / "checkpoints" / "last").exists():
+            return "output_dir_last"
+        return "output_dir_checkpoint_scan"
+    return "directory"
+
+
+def _extract_teacher_checkpoint_step(teacher_pretrained_path: Path) -> int | None:
+    for candidate in (teacher_pretrained_path.parent, teacher_pretrained_path.parent.parent):
+        if candidate.name.isdigit():
+            return int(candidate.name)
+    return None
+
+
+def _prepare_act_kd_startup(
+    cfg: TrainPipelineConfig,
+    policy: PreTrainedPolicy,
+    preprocessor: PolicyProcessorPipeline,
+    accelerator: Accelerator,
+) -> KDTeacherMetadata | None:
+    if not _is_act_kd_training(cfg):
+        return None
+
+    if not has_method(policy, "attach_teacher_bundle"):
+        raise RuntimeError(
+            "ACT KD startup requires the policy to expose `attach_teacher_bundle(...)`."
+        )
+
+    existing_metadata = cfg.get_kd_teacher_metadata()
+    pinned_teacher_path = cfg.get_pinned_kd_teacher_pretrained_path()
+    if pinned_teacher_path is not None:
+        teacher_pretrained_path = Path(pinned_teacher_path)
+        if not teacher_pretrained_path.exists():
+            raise FileNotFoundError(
+                "Pinned ACT KD teacher snapshot from run metadata does not exist anymore: "
+                f"{teacher_pretrained_path}"
+            )
+    else:
+        runtime_teacher_source = cfg.get_runtime_teacher_source_path()
+        if runtime_teacher_source is None:
+            raise RuntimeError("ACT KD is enabled but no teacher path is available at startup.")
+        teacher_pretrained_path = _resolve_teacher_pretrained_path(runtime_teacher_source)
+
+    teacher_bundle = load_act_teacher_bundle(
+        student_policy=policy,
+        student_preprocessor=preprocessor,
+        teacher_pretrained_path=teacher_pretrained_path,
+    )
+    policy.attach_teacher_bundle(teacher_bundle)
+
+    resolved_teacher_path = Path(
+        teacher_bundle.resolved_policy_path or teacher_pretrained_path
+    ).resolve()
+    original_teacher_policy_path = getattr(cfg.policy, "teacher_policy_path", None)
+    original_teacher_train_config = getattr(cfg.policy, "teacher_train_config", None)
+    original_teacher_source = original_teacher_policy_path or original_teacher_train_config or resolved_teacher_path
+    pinned_at = None
+    if existing_metadata is not None:
+        pinned_at = existing_metadata.extra.get("pinned_at")
+
+    metadata = merge_kd_teacher_metadata(
+        {
+            "comparison_space": teacher_bundle.comparison_space,
+            "processor_compatibility": (
+                existing_metadata.processor_compatibility_mode
+                if existing_metadata is not None and existing_metadata.processor_compatibility_mode is not None
+                else "strict" if getattr(cfg.policy, "kd_strict_processor_compatibility", False) else "relaxed"
+            ),
+            "metric_aggregation_mode": (
+                "mean_across_processes_before_logging"
+                if accelerator.num_processes > 1
+                else "single_process"
+            ),
+            "teacher": {
+                "original_path": original_teacher_source,
+                "pinned_pretrained_path": resolved_teacher_path,
+                "checkpoint_step": (
+                    existing_metadata.teacher_checkpoint_step
+                    if existing_metadata is not None and existing_metadata.teacher_checkpoint_step is not None
+                    else _extract_teacher_checkpoint_step(resolved_teacher_path)
+                ),
+                "source_kind": (
+                    existing_metadata.teacher_source_kind
+                    if existing_metadata is not None and existing_metadata.teacher_source_kind is not None
+                    else _infer_teacher_source_kind(Path(original_teacher_source), resolved_teacher_path)
+                ),
+                "pinned_from_run_metadata": cfg.get_pinned_kd_teacher_pretrained_path() is not None,
+            },
+            "pinned_at": pinned_at or datetime.now(timezone.utc).isoformat(),
+        },
+        existing_metadata,
+    )
+
+    cfg.kd_teacher_metadata = kd_teacher_metadata_to_dict(metadata)
+
+    if accelerator.is_main_process:
+        metadata_path = cfg.pin_kd_teacher_metadata(metadata, cfg.output_dir)
+        logging.info(
+            "Pinned ACT KD teacher to %s (%s). Metadata written to %s",
+            resolved_teacher_path,
+            metadata.teacher_source_kind,
+            metadata_path,
+        )
+
+    accelerator.wait_for_everyone()
+    return metadata
+
+
+def _update_train_tracker_from_output_dict(
+    train_tracker: MetricsTracker,
+    output_dict: dict[str, Any] | None,
+    accelerator: Accelerator,
+) -> dict[str, float]:
+    reduced_output_dict = reduce_metrics_dict(
+        output_dict,
+        accelerator=accelerator,
+        reduction="mean",
+        device=accelerator.device,
+    )
+    if not reduced_output_dict:
+        return {}
+
+    if (
+        "kd_to_bc_ratio" not in reduced_output_dict
+        and "kd_weighted_l1_loss" in reduced_output_dict
+        and "l1_loss" in reduced_output_dict
+    ):
+        l1_loss = reduced_output_dict["l1_loss"]
+        if l1_loss != 0:
+            reduced_output_dict["kd_weighted_to_bc_ratio"] = reduced_output_dict["kd_weighted_l1_loss"] / l1_loss
+
+    missing_metric_names = [name for name in reduced_output_dict if name not in train_tracker.metrics]
+    if missing_metric_names:
+        train_tracker.register_metrics(_make_policy_metric_meters(missing_metric_names))
+
+    train_tracker.update_from_dict(reduced_output_dict)
+    return reduced_output_dict
 
 
 @parser.wrap()
@@ -243,6 +448,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         **postprocessor_kwargs,
     )
 
+    _prepare_act_kd_startup(cfg, policy, preprocessor, accelerator)
+
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
@@ -341,6 +548,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
         )
+        _update_train_tracker_from_output_dict(train_tracker, output_dict, accelerator)
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
@@ -353,10 +561,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         if is_log_step:
             logging.info(train_tracker)
             if wandb_logger:
-                wandb_log_dict = train_tracker.to_dict()
-                if output_dict:
-                    wandb_log_dict.update(output_dict)
-                wandb_logger.log_dict(wandb_log_dict, step)
+                wandb_logger.log_dict(train_tracker.to_dict(), step)
             train_tracker.reset_averages()
 
         if cfg.save_checkpoint and is_saving_step:

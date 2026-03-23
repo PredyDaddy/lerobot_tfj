@@ -29,6 +29,15 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.optim import OptimizerConfig
 from lerobot.optim.schedulers import LRSchedulerConfig
 from lerobot.utils.hub import HubMixin
+from lerobot.utils.train_metadata import (
+    KDTeacherMetadata,
+    as_kd_teacher_metadata,
+    kd_teacher_metadata_to_dict,
+    load_kd_teacher_metadata,
+    merge_kd_teacher_metadata,
+    resolve_kd_teacher_metadata_for_resume,
+    save_kd_teacher_metadata,
+)
 
 TRAIN_CONFIG_NAME = "train_config.json"
 
@@ -67,8 +76,13 @@ class TrainPipelineConfig(HubMixin):
     checkpoint_path: Path | None = field(init=False, default=None)
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
+    # Training-only metadata for pinning runtime teacher snapshots. This must not be written back into
+    # `pretrained_model/config.json`.
+    kd_teacher_metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        self._normalize_kd_teacher_metadata()
+
         # HACK: We parse again the cli args here to get the pretrained paths if there was some.
         policy_path = parser.get_path_arg("policy")
         if policy_path:
@@ -116,6 +130,9 @@ class TrainPipelineConfig(HubMixin):
             train_dir = f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"
             self.output_dir = Path("outputs/train") / train_dir
 
+        if self.resume:
+            self._refresh_resume_kd_teacher_metadata()
+
         if isinstance(self.dataset.repo_id, list):
             raise NotImplementedError("LeRobotMultiDataset is not currently implemented.")
 
@@ -138,7 +155,69 @@ class TrainPipelineConfig(HubMixin):
     def to_dict(self) -> dict[str, Any]:
         return draccus.encode(self)  # type: ignore[no-any-return]  # because of the third-party library draccus uses Any as the return type
 
+    def get_kd_teacher_metadata(self) -> KDTeacherMetadata | None:
+        return as_kd_teacher_metadata(self.kd_teacher_metadata)
+
+    def get_pinned_kd_teacher_pretrained_path(self) -> Path | None:
+        metadata = self.get_kd_teacher_metadata()
+        if metadata is None:
+            return None
+        return metadata.resolved_teacher_pretrained_path
+
+    def get_runtime_teacher_source_path(self) -> Path | None:
+        pinned_teacher_path = self.get_pinned_kd_teacher_pretrained_path()
+        if pinned_teacher_path is not None:
+            return pinned_teacher_path
+        if self.policy is None:
+            return None
+
+        teacher_policy_path = getattr(self.policy, "teacher_policy_path", None)
+        if teacher_policy_path is not None:
+            return teacher_policy_path
+
+        teacher_train_config = getattr(self.policy, "teacher_train_config", None)
+        if teacher_train_config is not None:
+            return teacher_train_config
+
+        return None
+
+    def pin_kd_teacher_metadata(
+        self,
+        metadata: KDTeacherMetadata | dict[str, Any],
+        root_dir: Path | None = None,
+    ) -> Path | None:
+        self.kd_teacher_metadata = kd_teacher_metadata_to_dict(metadata)
+        if not self.kd_teacher_metadata:
+            return None
+
+        if root_dir is None:
+            root_dir = self.output_dir
+        if root_dir is None:
+            return None
+
+        return save_kd_teacher_metadata(self.kd_teacher_metadata, root_dir)
+
+    def load_pinned_kd_teacher_metadata(self, root_dir: Path | None = None) -> KDTeacherMetadata | None:
+        disk_metadata = load_kd_teacher_metadata(root_dir)
+        # Preserve already-resolved in-memory metadata (for example a checkpoint pin restored during resume)
+        # when re-reading a run-level sidecar later in startup.
+        merged_metadata = merge_kd_teacher_metadata(self.kd_teacher_metadata, disk_metadata)
+        self.kd_teacher_metadata = kd_teacher_metadata_to_dict(merged_metadata)
+        return merged_metadata
+
+    def _refresh_resume_kd_teacher_metadata(self) -> None:
+        merged_metadata = resolve_kd_teacher_metadata_for_resume(
+            checkpoint_dir=self.checkpoint_path,
+            run_dir=self.output_dir,
+            embedded_metadata=self.kd_teacher_metadata,
+        )
+        self.kd_teacher_metadata = kd_teacher_metadata_to_dict(merged_metadata)
+
+    def _normalize_kd_teacher_metadata(self) -> None:
+        self.kd_teacher_metadata = kd_teacher_metadata_to_dict(self.kd_teacher_metadata)
+
     def _save_pretrained(self, save_directory: Path) -> None:
+        self._normalize_kd_teacher_metadata()
         with open(save_directory / TRAIN_CONFIG_NAME, "w") as f, draccus.config_type("json"):
             draccus.dump(self, f, indent=4)
 

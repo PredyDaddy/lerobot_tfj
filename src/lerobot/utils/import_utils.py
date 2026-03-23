@@ -14,8 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
+import sys
 import logging
 import pkgutil
+from pathlib import Path
 from typing import Any
 
 from draccus.choice_types import ChoiceRegistry
@@ -63,6 +65,45 @@ def is_package_available(pkg_name: str, return_version: bool = False) -> tuple[b
 
 _transformers_available = is_package_available("transformers")
 _peft_available = is_package_available("peft")
+
+
+def import_transformers_module():
+    """
+    Import the installed Hugging Face `transformers` package even when the repository
+    root contains a shadowing `transformers/` source checkout.
+    """
+
+    existing_module = sys.modules.get("transformers")
+    if existing_module is not None and hasattr(existing_module, "AutoConfig"):
+        return existing_module
+
+    repo_root = Path(__file__).resolve().parents[3]
+    original_sys_path = list(sys.path)
+    sys.modules.pop("transformers", None)
+
+    try:
+        filtered_sys_path = []
+        for entry in original_sys_path:
+            candidate = Path.cwd() if entry == "" else Path(entry).resolve()
+            if candidate == repo_root:
+                continue
+            filtered_sys_path.append(entry)
+
+        local_transformers_src = repo_root / "transformers" / "src"
+        if local_transformers_src.is_dir():
+            filtered_sys_path.insert(0, str(local_transformers_src))
+
+        sys.path = filtered_sys_path
+        module = importlib.import_module("transformers")
+        if not hasattr(module, "AutoConfig"):
+            raise ImportError(
+                "Imported `transformers` does not expose `AutoConfig`. "
+                "This usually means a local source checkout is shadowing the installed package."
+            )
+        sys.modules["transformers"] = module
+        return module
+    finally:
+        sys.path = original_sys_path
 
 
 def make_device_from_device_class(config: ChoiceRegistry) -> Any:

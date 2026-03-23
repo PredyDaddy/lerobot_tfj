@@ -17,6 +17,7 @@
 import builtins
 import logging
 import math
+from contextlib import nullcontext
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict
@@ -50,6 +51,7 @@ from lerobot.utils.constants import (
     OBS_LANGUAGE_TOKENS,
     OPENPI_ATTENTION_MASK_VALUE,
 )
+from lerobot.utils.pi_compat import ensure_siglip_check_available
 
 
 class ActionSelectKwargs(TypedDict, total=False):
@@ -541,6 +543,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         msg = """An incorrect transformer version is used, please create an issue on https://github.com/huggingface/lerobot/issues"""
 
+        if not ensure_siglip_check_available():
+            raise ValueError(msg)
+
         try:
             from transformers.models.siglip import check
 
@@ -742,7 +747,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return F.mse_loss(u_t, v_t, reduction="none")
 
-    @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
         self,
         images,
@@ -769,38 +773,44 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        with torch.no_grad():
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+            prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+            prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+            prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+            self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
+            _, past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=prefix_att_2d_masks_4d,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=True,
+            )
 
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
+        rtc_guidance_enabled = self._rtc_enabled() and kwargs.get("prev_chunk_left_over") is not None
 
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
 
-            # Define a closure function to properly capture expanded_time
-            # This avoids the lambda expression (E731) and loop variable binding (B023) issues
+            # When RTC guidance is active, the denoiser must keep a graph from x_t
+            # so RTCProcessor.autograd.grad can differentiate through the denoise step.
             def denoise_step_partial_call(input_x_t, current_timestep=expanded_time):
-                return self.denoise_step(
-                    prefix_pad_masks=prefix_pad_masks,
-                    past_key_values=past_key_values,
-                    x_t=input_x_t,
-                    timestep=current_timestep,
-                )
+                inference_context = torch.enable_grad() if rtc_guidance_enabled else torch.no_grad()
+                with inference_context:
+                    if rtc_guidance_enabled:
+                        input_x_t = input_x_t.requires_grad_(True)
+                    return self.denoise_step(
+                        prefix_pad_masks=prefix_pad_masks,
+                        past_key_values=past_key_values,
+                        x_t=input_x_t,
+                        timestep=current_timestep,
+                    )
 
             if self._rtc_enabled():
                 inference_delay = kwargs.get("inference_delay")
@@ -989,8 +999,25 @@ class PI05Policy(PreTrainedPolicy):
             if remap_count > 0:
                 print(f"Remapped {remap_count} state dict keys")
 
-            # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            # Load non-strict first so we can filter known tied-weight artifacts
+            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
+            missing_keys = model._filter_known_load_state_dict_issues(missing_keys, remapped_state_dict)
+
+            if strict and (missing_keys or unexpected_keys):
+                error_msgs = []
+                if missing_keys:
+                    error_msgs.append(
+                        "Missing key(s) in state_dict: "
+                        + ", ".join(f'"{key}"' for key in missing_keys)
+                        + ". "
+                    )
+                if unexpected_keys:
+                    error_msgs.append(
+                        "Unexpected key(s) in state_dict: "
+                        + ", ".join(f'"{key}"' for key in unexpected_keys)
+                        + ". "
+                    )
+                raise RuntimeError(f"Error(s) in loading state_dict for {model.__class__.__name__}:\n\t" + "\n\t".join(error_msgs))
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -1019,6 +1046,30 @@ class PI05Policy(PreTrainedPolicy):
             print(f"Warning: Could not remap state dict keys: {e}")
 
         return model
+
+    def _filter_known_load_state_dict_issues(
+        self, missing_keys: list[str], loaded_state_dict: dict[str, torch.Tensor]
+    ) -> list[str]:
+        filtered_missing_keys: list[str] = []
+
+        tied_embed_key = "model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
+        tied_lm_head_key = "model.paligemma_with_expert.paligemma.lm_head.weight"
+
+        for key in missing_keys:
+            if key == tied_embed_key and tied_lm_head_key in loaded_state_dict:
+                try:
+                    embed_tokens = (
+                        self.model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight
+                    )
+                    lm_head = self.model.paligemma_with_expert.paligemma.lm_head.weight
+                    if embed_tokens.untyped_storage().data_ptr() == lm_head.untyped_storage().data_ptr():
+                        continue
+                except Exception:
+                    pass
+
+            filtered_missing_keys.append(key)
+
+        return filtered_missing_keys
 
     def _fix_pytorch_state_dict_keys(
         self, state_dict, model_config
@@ -1064,11 +1115,6 @@ class PI05Policy(PreTrainedPolicy):
             if key.startswith("state_proj."):
                 logging.warning(f"Skipping state_proj key in pi05 mode: {key}")
                 continue
-
-            # Handle vision tower embedding layer potential differences
-            if "patch_embedding" in key:
-                # Some checkpoints might have this, but current model expects different structure
-                logging.warning(f"Vision embedding key might need handling: {key}")
 
             fixed_state_dict[new_key] = value
 
@@ -1188,23 +1234,24 @@ class PI05Policy(PreTrainedPolicy):
 
         return self._action_queue.popleft()
 
-    @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         self.eval()
 
-        # Prepare inputs
-        images, img_masks = self._preprocess_images(batch)
-        tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        inference_context = nullcontext() if self._rtc_enabled() else torch.no_grad()
+        with inference_context:
+            # Prepare inputs
+            images, img_masks = self._preprocess_images(batch)
+            tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-        # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
-        actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
+            # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
+            actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
 
-        # Unpad actions to actual action dimension
-        original_action_dim = self.config.output_features[ACTION].shape[0]
-        actions = actions[:, :, :original_action_dim]
+            # Unpad actions to actual action dimension
+            original_action_dim = self.config.output_features[ACTION].shape[0]
+            actions = actions[:, :, :original_action_dim]
 
-        return actions
+            return actions
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training."""

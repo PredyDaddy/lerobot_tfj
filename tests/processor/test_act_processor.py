@@ -22,7 +22,10 @@ import torch
 
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.policies.act.configuration_act import ACTConfig
-from lerobot.policies.act.processor_act import make_act_pre_post_processors
+from lerobot.policies.act.processor_act import (
+    assert_act_kd_processor_compatibility,
+    make_act_pre_post_processors,
+)
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DataProcessorPipeline,
@@ -33,19 +36,23 @@ from lerobot.processor import (
     UnnormalizerProcessorStep,
 )
 from lerobot.processor.converters import create_transition, transition_to_batch
-from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 
-def create_default_config():
+def create_default_config(*, image_keys: tuple[str, ...] = ()):
     """Create a default ACT configuration for testing."""
     config = ACTConfig()
-    config.input_features = {
+    input_features = {
         OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(7,)),
     }
+    for image_key in image_keys:
+        input_features[image_key] = PolicyFeature(type=FeatureType.VISUAL, shape=(3, 32, 32))
+    config.input_features = input_features
     config.output_features = {
         ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(4,)),
     }
     config.normalization_mapping = {
+        FeatureType.VISUAL: NormalizationMode.MEAN_STD,
         FeatureType.STATE: NormalizationMode.MEAN_STD,
         FeatureType.ACTION: NormalizationMode.MEAN_STD,
     }
@@ -53,12 +60,15 @@ def create_default_config():
     return config
 
 
-def create_default_stats():
+def create_default_stats(*, image_keys: tuple[str, ...] = ()):
     """Create default dataset statistics for testing."""
-    return {
+    stats = {
         OBS_STATE: {"mean": torch.zeros(7), "std": torch.ones(7)},
         ACTION: {"mean": torch.zeros(4), "std": torch.ones(4)},
     }
+    for image_key in image_keys:
+        stats[image_key] = {"mean": torch.zeros(3, 1, 1), "std": torch.ones(3, 1, 1)}
+    return stats
 
 
 def test_make_act_processor_basic():
@@ -83,6 +93,117 @@ def test_make_act_processor_basic():
     assert len(postprocessor.steps) == 2
     assert isinstance(postprocessor.steps[0], UnnormalizerProcessorStep)
     assert isinstance(postprocessor.steps[1], DeviceProcessorStep)
+
+
+def test_act_processor_kd_compatibility_passes_for_matching_processors():
+    image_keys = (f"{OBS_IMAGES}.top", f"{OBS_IMAGES}.wrist")
+    student_config = create_default_config(image_keys=image_keys)
+    teacher_config = create_default_config(image_keys=image_keys)
+    stats = create_default_stats(image_keys=image_keys)
+
+    student_preprocessor, _ = make_act_pre_post_processors(student_config, stats)
+    teacher_preprocessor, _ = make_act_pre_post_processors(teacher_config, stats)
+
+    report = assert_act_kd_processor_compatibility(
+        student_config=student_config,
+        student_preprocessor=student_preprocessor,
+        teacher_config=teacher_config,
+        teacher_preprocessor=teacher_preprocessor,
+    )
+
+    assert report.compatible is True
+    assert report.comparison_space == "normalized_action_space"
+
+
+def test_act_processor_kd_compatibility_fails_on_stats_mismatch():
+    image_keys = (f"{OBS_IMAGES}.top",)
+    student_config = create_default_config(image_keys=image_keys)
+    teacher_config = create_default_config(image_keys=image_keys)
+    student_stats = create_default_stats(image_keys=image_keys)
+    teacher_stats = create_default_stats(image_keys=image_keys)
+    teacher_stats[ACTION]["mean"] = torch.ones(4)
+
+    student_preprocessor, _ = make_act_pre_post_processors(student_config, student_stats)
+    teacher_preprocessor, _ = make_act_pre_post_processors(teacher_config, teacher_stats)
+
+    with pytest.raises(ValueError, match="statistics must match"):
+        assert_act_kd_processor_compatibility(
+            student_config=student_config,
+            student_preprocessor=student_preprocessor,
+            teacher_config=teacher_config,
+            teacher_preprocessor=teacher_preprocessor,
+        )
+
+
+def test_act_processor_kd_compatibility_passes_with_equivalent_normalization_stats_and_extra_metadata():
+    image_keys = (f"{OBS_IMAGES}.top",)
+    student_config = create_default_config(image_keys=image_keys)
+    teacher_config = create_default_config(image_keys=image_keys)
+    teacher_stats = create_default_stats(image_keys=image_keys)
+    student_stats = create_default_stats(image_keys=image_keys)
+
+    student_stats[OBS_STATE]["mean"] = student_stats[OBS_STATE]["mean"].to(torch.float64)
+    student_stats[OBS_STATE]["std"] = student_stats[OBS_STATE]["std"].to(torch.float64)
+    student_stats[ACTION]["mean"] = student_stats[ACTION]["mean"].to(torch.float64)
+    student_stats[ACTION]["std"] = student_stats[ACTION]["std"].to(torch.float64)
+    student_stats[image_keys[0]]["mean"] = student_stats[image_keys[0]]["mean"].to(torch.float64)
+    student_stats[image_keys[0]]["std"] = student_stats[image_keys[0]]["std"].to(torch.float64)
+    student_stats["timestamp"] = {
+        "count": torch.tensor([123], dtype=torch.int64),
+        "mean": torch.tensor([1.23], dtype=torch.float64),
+    }
+
+    student_preprocessor, _ = make_act_pre_post_processors(student_config, student_stats)
+    teacher_preprocessor, _ = make_act_pre_post_processors(teacher_config, teacher_stats)
+
+    report = assert_act_kd_processor_compatibility(
+        student_config=student_config,
+        student_preprocessor=student_preprocessor,
+        teacher_config=teacher_config,
+        teacher_preprocessor=teacher_preprocessor,
+    )
+
+    assert report.compatible is True
+    assert report.comparison_space == "normalized_action_space"
+
+
+def test_act_processor_kd_compatibility_fails_on_rename_mismatch():
+    image_keys = (f"{OBS_IMAGES}.top",)
+    student_config = create_default_config(image_keys=image_keys)
+    teacher_config = create_default_config(image_keys=image_keys)
+    stats = create_default_stats(image_keys=image_keys)
+
+    student_preprocessor, _ = make_act_pre_post_processors(student_config, stats)
+    teacher_preprocessor, _ = make_act_pre_post_processors(teacher_config, stats)
+    teacher_preprocessor.steps[0].rename_map = {OBS_STATE: "renamed.state"}
+
+    with pytest.raises(ValueError, match="rename behavior must match"):
+        assert_act_kd_processor_compatibility(
+            student_config=student_config,
+            student_preprocessor=student_preprocessor,
+            teacher_config=teacher_config,
+            teacher_preprocessor=teacher_preprocessor,
+        )
+
+
+def test_act_processor_kd_compatibility_fails_on_image_key_order_mismatch():
+    student_image_keys = (f"{OBS_IMAGES}.top", f"{OBS_IMAGES}.wrist")
+    teacher_image_keys = tuple(reversed(student_image_keys))
+    student_config = create_default_config(image_keys=student_image_keys)
+    teacher_config = create_default_config(image_keys=teacher_image_keys)
+    student_stats = create_default_stats(image_keys=student_image_keys)
+    teacher_stats = create_default_stats(image_keys=teacher_image_keys)
+
+    student_preprocessor, _ = make_act_pre_post_processors(student_config, student_stats)
+    teacher_preprocessor, _ = make_act_pre_post_processors(teacher_config, teacher_stats)
+
+    with pytest.raises(ValueError, match="image key order must match"):
+        assert_act_kd_processor_compatibility(
+            student_config=student_config,
+            student_preprocessor=student_preprocessor,
+            teacher_config=teacher_config,
+            teacher_preprocessor=teacher_preprocessor,
+        )
 
 
 def test_act_processor_normalization():

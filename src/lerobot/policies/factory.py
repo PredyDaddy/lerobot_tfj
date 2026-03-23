@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from typing import Any, TypedDict
 
 import torch
@@ -48,6 +49,107 @@ from lerobot.processor.converters import (
     transition_to_policy_action,
 )
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+
+_GROOT_PREPROCESSOR_COMPATIBILITY_FIELDS = frozenset({"stats", "normalize_min_max"})
+_GROOT_POSTPROCESSOR_COMPATIBILITY_FIELDS = frozenset(
+    {"stats", "normalize_min_max", "env_action_dim", "output_mode"}
+)
+
+
+def _merge_processor_override_dicts(
+    base: dict[str, Any] | None,
+    extra: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Recursively merge processor overrides while preserving unrelated caller keys.
+
+    `extra` wins on leaf conflicts so policy-specific safety overrides can still
+    force required settings such as stats injection, while caller-provided keys
+    like chunk output mode or device overrides remain intact.
+    """
+    merged = deepcopy(base) if base is not None else {}
+    if extra is None:
+        return merged
+
+    for key, value in extra.items():
+        existing = merged.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            merged[key] = _merge_processor_override_dicts(existing, value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
+
+
+def _translate_groot_legacy_processor_override(
+    overrides: dict[str, Any] | None,
+    *,
+    legacy_key: str,
+    target_key: str,
+    supported_fields: frozenset[str],
+) -> dict[str, Any]:
+    """Translate generic normalization overrides to the GROOT-specific processor step.
+
+    Older warm-start/resume paths still pass `normalizer_processor` /
+    `unnormalizer_processor` overrides that belong to ACT-like pipelines. GROOT does not
+    expose those steps, so passing them through to `from_pretrained` triggers strict
+    override validation failures during resume. We retain the compatible fields (for
+    example `stats`) and remap them onto the saved GROOT step instead.
+    """
+    translated = deepcopy(overrides) if overrides is not None else {}
+    legacy_overrides = translated.pop(legacy_key, None)
+    if not isinstance(legacy_overrides, dict):
+        return translated
+
+    compatibility_overrides = {
+        key: deepcopy(value) for key, value in legacy_overrides.items() if key in supported_fields
+    }
+    if not compatibility_overrides:
+        return translated
+
+    translated[target_key] = _merge_processor_override_dicts(
+        translated.get(target_key),
+        compatibility_overrides,
+    )
+    return translated
+
+
+def _extract_groot_override_stats(
+    overrides: dict[str, Any] | None,
+    *,
+    step_key: str,
+) -> dict[str, dict[str, torch.Tensor]] | None:
+    if overrides is None:
+        return None
+
+    step_overrides = overrides.get(step_key)
+    if not isinstance(step_overrides, dict):
+        return None
+
+    stats = step_overrides.get("stats")
+    if stats is None:
+        return None
+    return deepcopy(stats)
+
+
+def _build_groot_required_processor_overrides(
+    policy_cfg: GrootConfig,
+    dataset_stats: dict[str, dict[str, torch.Tensor]] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    env_action_dim = policy_cfg.output_features["action"].shape[0]
+    return (
+        {
+            "groot_pack_inputs_v3": {
+                "stats": dataset_stats,
+                "normalize_min_max": True,
+            }
+        },
+        {
+            "groot_action_unpack_unnormalize_v1": {
+                "stats": dataset_stats,
+                "normalize_min_max": True,
+                "env_action_dim": env_action_dim,
+            }
+        },
+    )
 
 
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:
@@ -207,26 +309,42 @@ def make_pre_post_processors(
             policy configuration type.
     """
     if pretrained_path:
-        # TODO(Steven): Temporary patch, implement correctly the processors for Gr00t
         if isinstance(policy_cfg, GrootConfig):
-            # GROOT handles normalization in groot_pack_inputs_v3 step
-            # Need to override both stats AND normalize_min_max since saved config might be empty
-            preprocessor_overrides = {}
-            postprocessor_overrides = {}
-            preprocessor_overrides["groot_pack_inputs_v3"] = {
-                "stats": kwargs.get("dataset_stats"),
-                "normalize_min_max": True,
-            }
-
-            # Also ensure postprocessing slices to env action dim and unnormalizes with dataset stats
-            env_action_dim = policy_cfg.output_features["action"].shape[0]
-            postprocessor_overrides["groot_action_unpack_unnormalize_v1"] = {
-                "stats": kwargs.get("dataset_stats"),
-                "normalize_min_max": True,
-                "env_action_dim": env_action_dim,
-            }
-            kwargs["preprocessor_overrides"] = preprocessor_overrides
-            kwargs["postprocessor_overrides"] = postprocessor_overrides
+            preprocessor_overrides = _translate_groot_legacy_processor_override(
+                kwargs.get("preprocessor_overrides"),
+                legacy_key="normalizer_processor",
+                target_key="groot_pack_inputs_v3",
+                supported_fields=_GROOT_PREPROCESSOR_COMPATIBILITY_FIELDS,
+            )
+            postprocessor_overrides = _translate_groot_legacy_processor_override(
+                kwargs.get("postprocessor_overrides"),
+                legacy_key="unnormalizer_processor",
+                target_key="groot_action_unpack_unnormalize_v1",
+                supported_fields=_GROOT_POSTPROCESSOR_COMPATIBILITY_FIELDS,
+            )
+            groot_dataset_stats = kwargs.get("dataset_stats")
+            if groot_dataset_stats is None:
+                groot_dataset_stats = _extract_groot_override_stats(
+                    preprocessor_overrides,
+                    step_key="groot_pack_inputs_v3",
+                )
+            if groot_dataset_stats is None:
+                groot_dataset_stats = _extract_groot_override_stats(
+                    postprocessor_overrides,
+                    step_key="groot_action_unpack_unnormalize_v1",
+                )
+            required_pre_overrides, required_post_overrides = _build_groot_required_processor_overrides(
+                policy_cfg=policy_cfg,
+                dataset_stats=groot_dataset_stats,
+            )
+            kwargs["preprocessor_overrides"] = _merge_processor_override_dicts(
+                preprocessor_overrides,
+                required_pre_overrides,
+            )
+            kwargs["postprocessor_overrides"] = _merge_processor_override_dicts(
+                postprocessor_overrides,
+                required_post_overrides,
+            )
 
         return (
             PolicyProcessorPipeline.from_pretrained(

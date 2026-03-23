@@ -103,6 +103,12 @@ class SmolVLAConfig(PreTrainedConfig):
     min_period: float = 4e-3  # sensitivity range for the timestep used in sine-cosine positional encoding
     max_period: float = 4.0
 
+    # RL / value head settings.
+    value_head_hidden_dim: int = 512
+    value_head_num_layers: int = 2
+    value_head_dropout: float = 0.0
+    value_head_pooling: str = "mean"  # {"mean", "last"}
+
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
 
@@ -118,6 +124,18 @@ class SmolVLAConfig(PreTrainedConfig):
         if self.use_delta_joint_actions_aloha:
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
+            )
+        if self.value_head_hidden_dim <= 0:
+            raise ValueError(
+                f"`value_head_hidden_dim` must be > 0, got {self.value_head_hidden_dim}."
+            )
+        if self.value_head_num_layers <= 0:
+            raise ValueError(
+                f"`value_head_num_layers` must be > 0, got {self.value_head_num_layers}."
+            )
+        if self.value_head_pooling not in {"mean", "last"}:
+            raise ValueError(
+                f"`value_head_pooling` must be one of {{'mean', 'last'}}, got {self.value_head_pooling!r}."
             )
 
     def validate_features(self) -> None:

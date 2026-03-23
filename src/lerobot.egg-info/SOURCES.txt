@@ -33,6 +33,8 @@ src/lerobot/configs/eval.py
 src/lerobot/configs/parser.py
 src/lerobot/configs/policies.py
 src/lerobot/configs/train.py
+src/lerobot/configs/train_groot_hybrid.py
+src/lerobot/configs/train_smolvla_hybrid.py
 src/lerobot/configs/types.py
 src/lerobot/datasets/aggregate.py
 src/lerobot/datasets/backward_compatibility.py
@@ -78,6 +80,7 @@ src/lerobot/policies/factory.py
 src/lerobot/policies/pretrained.py
 src/lerobot/policies/utils.py
 src/lerobot/policies/act/configuration_act.py
+src/lerobot/policies/act/distillation_utils.py
 src/lerobot/policies/act/modeling_act.py
 src/lerobot/policies/act/processor_act.py
 src/lerobot/policies/diffusion/configuration_diffusion.py
@@ -120,6 +123,7 @@ src/lerobot/policies/sac/reward_model/processor_classifier.py
 src/lerobot/policies/smolvla/configuration_smolvla.py
 src/lerobot/policies/smolvla/modeling_smolvla.py
 src/lerobot/policies/smolvla/processor_smolvla.py
+src/lerobot/policies/smolvla/rl_types.py
 src/lerobot/policies/smolvla/smolvlm_with_expert.py
 src/lerobot/policies/tdmpc/configuration_tdmpc.py
 src/lerobot/policies/tdmpc/modeling_tdmpc.py
@@ -156,6 +160,18 @@ src/lerobot/rl/learner_service.py
 src/lerobot/rl/process.py
 src/lerobot/rl/queue.py
 src/lerobot/rl/wandb_utils.py
+src/lerobot/rl/groot_hybrid/__init__.py
+src/lerobot/rl/groot_hybrid/buffer.py
+src/lerobot/rl/groot_hybrid/collector.py
+src/lerobot/rl/groot_hybrid/losses.py
+src/lerobot/rl/groot_hybrid/offline_replay.py
+src/lerobot/rl/groot_hybrid/trainer.py
+src/lerobot/rl/groot_hybrid/types.py
+src/lerobot/rl/smolvla_hybrid/__init__.py
+src/lerobot/rl/smolvla_hybrid/buffer.py
+src/lerobot/rl/smolvla_hybrid/collector.py
+src/lerobot/rl/smolvla_hybrid/losses.py
+src/lerobot/rl/smolvla_hybrid/trainer.py
 src/lerobot/robots/__init__.py
 src/lerobot/robots/config.py
 src/lerobot/robots/robot.py
@@ -199,6 +215,7 @@ src/lerobot/scripts/lerobot_replay.py
 src/lerobot/scripts/lerobot_setup_motors.py
 src/lerobot/scripts/lerobot_teleoperate.py
 src/lerobot/scripts/lerobot_train.py
+src/lerobot/scripts/lerobot_train_smolvla_hybrid.py
 src/lerobot/teleoperators/__init__.py
 src/lerobot/teleoperators/config.py
 src/lerobot/teleoperators/teleoperator.py
@@ -245,9 +262,11 @@ src/lerobot/utils/hub.py
 src/lerobot/utils/import_utils.py
 src/lerobot/utils/io_utils.py
 src/lerobot/utils/logging_utils.py
+src/lerobot/utils/pi_compat.py
 src/lerobot/utils/random_utils.py
 src/lerobot/utils/robot_utils.py
 src/lerobot/utils/rotation.py
+src/lerobot/utils/train_metadata.py
 src/lerobot/utils/train_utils.py
 src/lerobot/utils/transition.py
 src/lerobot/utils/utils.py

@@ -13,8 +13,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
+
+import torch
 
 from lerobot.utils.utils import format_big_number
 
@@ -132,7 +134,7 @@ class MetricsTracker:
         Updates metrics that depend on 'step' for one step.
         """
         self.steps += 1
-        self.samples += self._batch_size * (self.accelerator.num_processes if self.accelerator else 1)
+        self.samples += self._batch_size
         self.episodes = self.samples / self._avg_samples_per_ep
         self.epochs = self.samples / self._num_frames
 
@@ -149,6 +151,13 @@ class MetricsTracker:
         ]
         return " ".join(display_list)
 
+    def register_metrics(self, metrics: Mapping[str, AverageMeter], overwrite: bool = False) -> None:
+        """Registers additional metrics after tracker construction."""
+        for name, meter in metrics.items():
+            if name in self.metrics and not overwrite:
+                raise ValueError(f"Metric '{name}' is already registered.")
+            self.metrics[name] = meter
+
     def to_dict(self, use_avg: bool = True) -> dict[str, int | float]:
         """
         Returns the current metric values (or averages if `use_avg=True`) as a dict.
@@ -161,7 +170,66 @@ class MetricsTracker:
             **{k: m.avg if use_avg else m.val for k, m in self.metrics.items()},
         }
 
+    def update_from_dict(
+        self,
+        values: Mapping[str, Any],
+        *,
+        n: int = 1,
+        ignore_missing: bool = False,
+    ) -> None:
+        """Updates registered meters from a dictionary of scalar values."""
+        for key, value in values.items():
+            if key not in self.metrics:
+                if ignore_missing:
+                    continue
+                raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{key}'")
+
+            if isinstance(value, torch.Tensor):
+                if value.numel() != 1:
+                    raise ValueError(f"Metric '{key}' must be scalar, got tensor with shape {tuple(value.shape)}.")
+                scalar = value.item()
+            else:
+                scalar = float(value)
+
+            self.metrics[key].update(scalar, n=n)
+
     def reset_averages(self) -> None:
         """Resets average meters."""
         for m in self.metrics.values():
             m.reset()
+
+
+def reduce_metrics_dict(
+    metrics: Mapping[str, Any] | None,
+    accelerator: Any | None = None,
+    *,
+    reduction: str = "mean",
+    device: torch.device | None = None,
+) -> dict[str, float]:
+    """Reduces a flat scalar metrics dictionary across processes."""
+    if not metrics:
+        return {}
+
+    reduced: dict[str, float] = {}
+    for key, value in metrics.items():
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                continue
+            tensor = value.detach()
+            target_device = device or tensor.device
+            if tensor.device != target_device:
+                tensor = tensor.to(target_device)
+            tensor = tensor.reshape(())
+        elif isinstance(value, bool):
+            tensor = torch.tensor(float(value), device=device or getattr(accelerator, "device", "cpu"))
+        elif isinstance(value, int | float):
+            tensor = torch.tensor(float(value), device=device or getattr(accelerator, "device", "cpu"))
+        else:
+            continue
+
+        if accelerator is not None and hasattr(accelerator, "reduce"):
+            tensor = accelerator.reduce(tensor, reduction=reduction)
+
+        reduced[key] = float(tensor.item() if isinstance(tensor, torch.Tensor) else tensor)
+
+    return reduced

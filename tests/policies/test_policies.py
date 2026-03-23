@@ -33,6 +33,7 @@ from lerobot.envs.factory import make_env, make_env_config
 from lerobot.envs.utils import preprocess_observation
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.act.distillation_utils import ACTTeacherBundle, KDProcessorCompatibilityReport
 from lerobot.policies.act.modeling_act import (
     ACTPolicy,
     ACTTemporalEnsembler,
@@ -474,6 +475,27 @@ def test_act_kd_requires_teacher_path():
         )
 
 
+def test_act_kd_tail_only_requires_tail_steps():
+    input_features = {
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(2,)),
+        f"{OBS_IMAGES}.top": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 32, 32)),
+    }
+    output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(2,))}
+
+    with pytest.raises(ValueError, match="Tail-only ACT KD requires at least one tail step"):
+        ACTConfig(
+            input_features=input_features,
+            output_features=output_features,
+            pretrained_backbone_weights=None,
+            kd=True,
+            teacher_policy_path=Path("/tmp/fake-teacher"),
+            chunk_size=4,
+            n_action_steps=4,
+            kd_prefix_weight=0.0,
+            kd_tail_weight=1.0,
+        )
+
+
 def test_resolve_teacher_pretrained_path_from_output_dir(tmp_path):
     teacher_output_dir = tmp_path / "teacher_run"
     pretrained_dir = teacher_output_dir / "checkpoints" / "000123" / "pretrained_model"
@@ -500,7 +522,7 @@ def test_act_forward_adds_kd_loss(monkeypatch):
         pretrained_backbone_weights=None,
         use_vae=False,
         chunk_size=4,
-        n_action_steps=4,
+        n_action_steps=2,
         dim_model=32,
         n_heads=4,
         dim_feedforward=64,
@@ -509,7 +531,9 @@ def test_act_forward_adds_kd_loss(monkeypatch):
         kd=True,
         teacher_policy_path=Path("/tmp/fake-teacher"),
         kd_weight=2.0,
-        kd_overlap_steps=3,
+        kd_overlap_steps=4,
+        kd_prefix_weight=2.0,
+        kd_tail_weight=0.5,
     )
     policy = ACTPolicy(config)
 
@@ -523,13 +547,19 @@ def test_act_forward_adds_kd_loss(monkeypatch):
         OBS_STATE: torch.zeros(1, 2),
         f"{OBS_IMAGES}.top": torch.zeros(1, 3, 32, 32),
         ACTION: torch.tensor([[[0.0, 0.0], [2.0, 2.0], [6.0, 6.0], [8.0, 8.0]]], dtype=torch.float32),
-        "action_is_pad": torch.tensor([[False, False, True, True]]),
+        "action_is_pad": torch.tensor([[False, False, False, True]]),
     }
 
     def fake_student_forward(_batch):
         return student_actions, (None, None)
 
     class FakeTeacherPolicy:
+        def requires_grad_(self, _requires_grad):
+            return self
+
+        def eval(self):
+            return self
+
         def to(self, _device):
             return self
 
@@ -537,16 +567,245 @@ def test_act_forward_adds_kd_loss(monkeypatch):
             return teacher_actions
 
     monkeypatch.setattr(policy.model, "forward", fake_student_forward)
-    monkeypatch.setattr(policy, "_get_teacher_policy", lambda: FakeTeacherPolicy())
+    teacher_policy = FakeTeacherPolicy()
+    teacher_policy.config = config
+    policy.attach_teacher_bundle(
+        ACTTeacherBundle(
+            policy=teacher_policy,
+            processor_compatibility=KDProcessorCompatibilityReport(compatible=True),
+        )
+    )
 
     loss, loss_dict = policy.forward(batch)
 
     action_mask = (~batch["action_is_pad"]).unsqueeze(-1)
     expected_l1 = (torch.abs(batch[ACTION] - student_actions) * action_mask).mean()
-    expected_kd = (torch.abs(student_actions[:, :3] - teacher_actions[:, :3]) * action_mask[:, :3]).mean()
-    expected_loss = expected_l1 + config.kd_weight * expected_kd
+    kd_error = torch.abs(student_actions[:, :4] - teacher_actions[:, :4])
+    expanded_action_mask = action_mask[:, :4].expand_as(kd_error)
+    expected_kd = (kd_error * expanded_action_mask).sum() / expanded_action_mask.sum()
+    kd_weights = torch.tensor([2.0, 2.0, 0.5, 0.5], dtype=torch.float32).view(1, 4, 1).expand_as(kd_error)
+    weighted_mask = expanded_action_mask * kd_weights
+    expected_weighted_kd = (kd_error * weighted_mask).sum() / weighted_mask.sum()
+    expected_prefix_kd = (kd_error[:, :2] * expanded_action_mask[:, :2]).sum() / expanded_action_mask[:, :2].sum()
+    expected_tail_kd = (kd_error[:, 2:] * expanded_action_mask[:, 2:]).sum() / expanded_action_mask[:, 2:].sum()
+    expected_loss = expected_l1 + config.kd_weight * expected_weighted_kd
 
     torch.testing.assert_close(loss, expected_loss)
     assert loss_dict["l1_loss"] == pytest.approx(expected_l1.item())
     assert loss_dict["kd_l1_loss"] == pytest.approx(expected_kd.item())
-    assert loss_dict["kd_overlap_steps"] == pytest.approx(3.0)
+    assert loss_dict["kd_weighted_l1_loss"] == pytest.approx(expected_weighted_kd.item())
+    assert loss_dict["kd_overlap_steps"] == pytest.approx(4.0)
+    assert loss_dict["kd_valid_ratio"] == pytest.approx(0.75)
+    assert loss_dict["kd_prefix_l1_loss"] == pytest.approx(expected_prefix_kd.item())
+    assert loss_dict["kd_tail_l1_loss"] == pytest.approx(expected_tail_kd.item())
+    assert loss_dict["kd_to_bc_ratio"] == pytest.approx((expected_weighted_kd / expected_l1).item())
+
+
+def test_act_forward_requires_teacher_bundle_for_stage_one_kd(monkeypatch):
+    input_features = {
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(2,)),
+        f"{OBS_IMAGES}.top": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 32, 32)),
+    }
+    output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(2,))}
+    config = ACTConfig(
+        input_features=input_features,
+        output_features=output_features,
+        pretrained_backbone_weights=None,
+        use_vae=False,
+        chunk_size=2,
+        n_action_steps=2,
+        dim_model=32,
+        n_heads=4,
+        dim_feedforward=64,
+        n_encoder_layers=1,
+        n_decoder_layers=1,
+        kd=True,
+        teacher_policy_path=Path("/tmp/fake-teacher"),
+    )
+    policy = ACTPolicy(config)
+    batch = {
+        OBS_STATE: torch.zeros(1, 2),
+        f"{OBS_IMAGES}.top": torch.zeros(1, 3, 32, 32),
+        ACTION: torch.zeros(1, 2, 2),
+        "action_is_pad": torch.zeros(1, 2, dtype=torch.bool),
+    }
+
+    monkeypatch.setattr(policy.model, "forward", lambda _batch: (torch.zeros(1, 2, 2), (None, None)))
+
+    with pytest.raises(RuntimeError, match="attach_teacher_bundle"):
+        policy.forward(batch)
+
+
+def test_act_forward_tail_only_kd_fails_when_runtime_overlap_has_no_tail(monkeypatch):
+    input_features = {
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(2,)),
+        f"{OBS_IMAGES}.top": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 32, 32)),
+    }
+    output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(2,))}
+    config = ACTConfig(
+        input_features=input_features,
+        output_features=output_features,
+        pretrained_backbone_weights=None,
+        use_vae=False,
+        chunk_size=4,
+        n_action_steps=2,
+        dim_model=32,
+        n_heads=4,
+        dim_feedforward=64,
+        n_encoder_layers=1,
+        n_decoder_layers=1,
+        kd=True,
+        teacher_policy_path=Path("/tmp/fake-teacher"),
+        kd_prefix_weight=0.0,
+        kd_tail_weight=1.0,
+    )
+    policy = ACTPolicy(config)
+    batch = {
+        OBS_STATE: torch.zeros(1, 2),
+        f"{OBS_IMAGES}.top": torch.zeros(1, 3, 32, 32),
+        ACTION: torch.zeros(1, 4, 2),
+        "action_is_pad": torch.zeros(1, 4, dtype=torch.bool),
+    }
+
+    monkeypatch.setattr(policy.model, "forward", lambda _batch: (torch.zeros(1, 4, 2), (None, None)))
+
+    class FakeTeacherPolicy:
+        def requires_grad_(self, _requires_grad):
+            return self
+
+        def eval(self):
+            return self
+
+        def to(self, _device):
+            return self
+
+        def predict_action_chunk(self, _batch):
+            return torch.zeros(1, 2, 2)
+
+    teacher_policy = FakeTeacherPolicy()
+    teacher_policy.config = ACTConfig(
+        input_features=input_features,
+        output_features=output_features,
+        pretrained_backbone_weights=None,
+        use_vae=False,
+        chunk_size=2,
+        n_action_steps=2,
+        dim_model=32,
+        n_heads=4,
+        dim_feedforward=64,
+        n_encoder_layers=1,
+        n_decoder_layers=1,
+    )
+    policy.attach_teacher_bundle(
+        ACTTeacherBundle(
+            policy=teacher_policy,
+            processor_compatibility=KDProcessorCompatibilityReport(compatible=True),
+        )
+    )
+
+    with pytest.raises(ValueError, match="Tail-only ACT KD requires at least one tail step"):
+        policy.forward(batch)
+
+
+def test_act_attach_teacher_bundle_fails_on_incompatible_processor_report():
+    input_features = {
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(2,)),
+        f"{OBS_IMAGES}.top": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 32, 32)),
+    }
+    output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(2,))}
+    student_config = ACTConfig(
+        input_features=input_features,
+        output_features=output_features,
+        pretrained_backbone_weights=None,
+        use_vae=False,
+        chunk_size=2,
+        n_action_steps=2,
+        dim_model=32,
+        n_heads=4,
+        dim_feedforward=64,
+        n_encoder_layers=1,
+        n_decoder_layers=1,
+        kd=True,
+        teacher_policy_path=Path("/tmp/fake-teacher"),
+    )
+    teacher_config = ACTConfig(
+        input_features=input_features,
+        output_features=output_features,
+        pretrained_backbone_weights=None,
+        use_vae=False,
+        chunk_size=2,
+        n_action_steps=2,
+        dim_model=32,
+        n_heads=4,
+        dim_feedforward=64,
+        n_encoder_layers=1,
+        n_decoder_layers=1,
+    )
+
+    policy = ACTPolicy(student_config)
+    teacher_policy = ACTPolicy(teacher_config)
+
+    with pytest.raises(ValueError, match="not compatible"):
+        policy.attach_teacher_bundle(
+            ACTTeacherBundle(
+                policy=teacher_policy,
+                processor_compatibility=KDProcessorCompatibilityReport(
+                    compatible=False,
+                    reason="Teacher and student ACT processors are not compatible for KD.",
+                ),
+            )
+        )
+
+
+def test_act_load_and_attach_teacher_bundle_uses_core_loader(monkeypatch):
+    input_features = {
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(2,)),
+        f"{OBS_IMAGES}.top": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 32, 32)),
+    }
+    output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(2,))}
+    config = ACTConfig(
+        input_features=input_features,
+        output_features=output_features,
+        pretrained_backbone_weights=None,
+        use_vae=False,
+        chunk_size=2,
+        n_action_steps=2,
+        dim_model=32,
+        n_heads=4,
+        dim_feedforward=64,
+        n_encoder_layers=1,
+        n_decoder_layers=1,
+        kd=True,
+        teacher_policy_path=Path("/tmp/fake-teacher"),
+    )
+    policy = ACTPolicy(config)
+
+    class FakeTeacherPolicy:
+        def requires_grad_(self, _requires_grad):
+            return self
+
+        def eval(self):
+            return self
+
+    teacher_policy = FakeTeacherPolicy()
+    teacher_policy.config = config
+    expected_bundle = ACTTeacherBundle(
+        policy=teacher_policy,
+        processor_compatibility=KDProcessorCompatibilityReport(compatible=True),
+    )
+
+    def fake_loader(*, student_policy, student_preprocessor, teacher_pretrained_path):
+        assert student_policy is policy
+        assert student_preprocessor == {"name": "student-preprocessor"}
+        assert teacher_pretrained_path == Path("/tmp/fake-teacher")
+        return expected_bundle
+
+    monkeypatch.setattr("lerobot.policies.act.modeling_act.load_act_teacher_bundle", fake_loader)
+
+    attached_bundle = policy.load_and_attach_teacher_bundle(
+        {"name": "student-preprocessor"},
+        Path("/tmp/fake-teacher"),
+    )
+
+    assert attached_bundle is expected_bundle
+    assert policy._get_teacher_bundle() is expected_bundle

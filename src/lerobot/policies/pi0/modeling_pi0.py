@@ -51,6 +51,7 @@ from lerobot.utils.constants import (
     OBS_STATE,
     OPENPI_ATTENTION_MASK_VALUE,
 )
+from lerobot.utils.pi_compat import ensure_siglip_check_available
 
 
 class ActionSelectKwargs(TypedDict, total=False):
@@ -544,6 +545,9 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
 
         msg = """An incorrect transformer version is used, please create an issue on https://github.com/huggingface/lerobot/issues"""
+
+        if not ensure_siglip_check_available():
+            raise ValueError(msg)
 
         try:
             from transformers.models.siglip import check

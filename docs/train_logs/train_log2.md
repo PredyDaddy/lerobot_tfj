@@ -138,8 +138,170 @@ nohup lerobot-train \
    > /data/tfj/lerobot/outputs/groot_grasp_block_in_bin1.log 2>&1 &
 
 ```bash
-python /data/tfj/lerobot/scripts/camera_overlay_align.py \
-   --reference-image /data/tfj/lerobot/outputs/reference_first_frame.png \
+export DISPLAY=:1
+export XAUTHORITY=/run/user/1003/gdm/Xauthority
+
+python /data/tfj/lerobot_tfj/scripts/camera_overlay_align.py \
+   --reference-image /data/tfj/lerobot_tfj/outputs/reference_first_frame.png \
    --camera-id 4 \
    --display-mode side_by_side
 ```
+
+conda run -n lerobot_flex
+python /data/tfj/lerobot_tfj/doc/lerobot_record_act_onnx.py \
+   --robot.id=my_so101 \
+   --robot.type=so101_follower \
+   --robot.calibration_dir=/home/cqy/.cache/huggingface/lerobot/calibration/robots/so101_follower \
+   --robot.port=/dev/ttyACM0 \
+   --robot.cameras='{"top":{"type":"opencv","index_or_path":4,"width":640,"height":480,"fps":30},"wrist":
+{"type":"opencv","index_or_path":6,"width":640,"height":480,"fps":30}}' \
+   --display_data=false \
+   --play_sounds=false \
+   --dataset.repo_id=admin123/eval_grasp_block_in_bin1 \
+   --dataset.root=/home/cqy/.cache/huggingface/lerobot/admin123/eval_grasp_block_in_bin2 \
+   --dataset.push_to_hub=false \
+   --dataset.num_episodes=5 \
+   --dataset.episode_time_s=300 \
+   --dataset.reset_time_s=10 \
+   --dataset.single_task="grasp block in bin" \
+   --policy.path=/data/tfj/lerobot_tfj/outputs/act_grasp_block_in_bin1/checkpoints/last/pretrained_model \
+   --policy.device=cuda \
+   --onnx.path=/data/tfj/lerobot_tfj/outputs/act_grasp_block_in_bin1/checkpoints/last/pretrained_model/act_core.onnx \
+   --onnx.provider=auto
+
+
+
+
+
+  python /data/tfj/lerobot_tfj/tfj_envs/pi_trt/scripts/run_pi05_onnx_infer_so101.py \
+      --robot-id my_so101 \
+      --robot-port /dev/ttyACM0 \
+      --robot-calibration-dir /home/cqy/.cache/huggingface/lerobot/calibration/robots/so101_follower \
+      --robot-max-relative-target 1 \
+      --top-cam-index 4 \
+      --wrist-cam-index 6 \
+      --camera-width 640 \
+      --camera-height 480 \
+      --camera-fps 30 \
+      --policy-path /data/tfj/lerobot_tfj/pi_model/pretrained_model \
+      --policy-device cpu \
+      --policy-n-action-steps 8 \
+      --policy-num-inference-steps 10 \
+      --policy-fixed-noise \
+      --policy-noise-seed 0 \
+      --onnx-path /data/tfj/lerobot_tfj/tfj_envs/pi_trt/docs/results/pi05_onnx_fix_20260311_230500/onnx \
+      --onnx-provider cuda \
+      --local-tokenizer-path /home/cqy/.cache/modelscope/hub/models/google/paligemma-3b-pt-224 \
+      --joint-delta-limit 0.7 \
+      --gripper-delta-limit 1.5 \
+      --joint-action-alpha 0.2 \
+      --gripper-action-alpha 0.35 \
+      --task "grasp block in bin" \
+      --run-time-s 10 \
+      --log-interval 5
+
+
+  python /data/tfj/lerobot_tfj/tfj_envs/pi_trt/scripts/run_pi05_torch_infer_so101.py \
+      --robot-id my_so101 \
+      --robot-port /dev/ttyACM0 \
+      --robot-calibration-dir /home/cqy/.cache/huggingface/lerobot/calibration/robots/so101_follower \
+      --robot-max-relative-target 1 \
+      --top-cam-index 4 \
+      --wrist-cam-index 6 \
+      --camera-width 640 \
+      --camera-height 480 \
+      --camera-fps 30 \
+      --policy-path /data/tfj/lerobot_tfj/pi_model/pretrained_model \
+      --policy-device cuda \
+      --policy-n-action-steps 8 \
+      --policy-num-inference-steps 10 \
+      --local-tokenizer-path /home/cqy/.cache/modelscope/hub/models/google/paligemma-3b-pt-224 \
+      --joint-delta-limit 0.7 \
+      --gripper-delta-limit 1.5 \
+      --joint-action-alpha 0.2 \
+      --gripper-action-alpha 0.35 \
+      --task "grasp block in bin" \
+      --run-time-s 10 \
+      --log-interval 5
+
+
+
+  cd /data/tfj/lerobot_tfj
+
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  python /data/tfj/lerobot_tfj/src/lerobot/scripts/lerobot_record.py \
+    --robot.type=so101_follower \
+    --robot.id=my_so101 \
+    --robot.port=/dev/ttyACM0 \
+    --robot.calibration_dir=/home/cqy/.cache/huggingface/lerobot/calibration/robots/so101_follower \
+    --robot.max_relative_target=0.5 \
+    --robot.cameras='{top: {type: opencv, index_or_path: 4, width: 640, height: 480, fps: 5}, wrist: {type: opencv, index_or_path: 6, width: 640, height: 480,
+  fps: 5}}' \
+    --dataset.repo_id=local/eval_pi05_so101_debug \
+    --dataset.single_task='grasp block in bin' \
+    --dataset.root=/tmp/lerobot_record_pi05 \
+    --dataset.fps=5 \
+    --dataset.episode_time_s=10 \
+    --dataset.reset_time_s=0 \
+    --dataset.num_episodes=1 \
+    --dataset.video=false \
+    --dataset.push_to_hub=false \
+    --dataset.num_image_writer_threads_per_camera=1 \
+    --policy.path=/data/tfj/lerobot_tfj/pi_model/pretrained_model \
+    --policy.device=cuda \
+    --policy.use_amp=false \
+    --policy.dtype=float32 \
+    --policy.n_action_steps=1 \
+    --policy.num_inference_steps=10 \
+    --display_data=false \
+    --play_sounds=false
+
+
+
+
+     source /home/cqy/miniconda3/etc/profile.d/conda.sh
+  conda activate lerobot_flex
+  cd /data/tfj/lerobot_tfj
+
+  PYTHONPATH=/data/tfj/lerobot_tfj/src \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  PI05_LOCAL_TOKENIZER_PATH=/home/cqy/.cache/modelscope/hub/models/google/paligemma-3b-pt-224 \
+  python /data/tfj/lerobot_tfj/src/lerobot/scripts/lerobot_record.py \
+    --robot.type=so101_follower \
+    --robot.id=so101_follower \
+    --robot.port=/dev/ttyACM0 \
+    --robot.calibration_dir=/home/cqy/.cache/huggingface/lerobot/calibration/robots/so101_follower \
+    --robot.max_relative_target=1.0 \
+    --robot.cameras='{top: {type: opencv, index_or_path: 4, width: 640, height: 480, fps: 5}, wrist: {type: opencv, index_or_path: 6, width: 640, height: 480, fps: 5}}' \
+    --dataset.repo_id=local/eval_pi05_so101_debug \
+    --dataset.single_task='grasp block in bin' \
+    --dataset.root=/tmp/lerobot_record_pi05 \
+    --dataset.fps=5 \
+    --dataset.episode_time_s=10 \
+    --dataset.reset_time_s=0 \
+    --dataset.num_episodes=1 \
+    --dataset.video=false \
+    --dataset.push_to_hub=false \
+    --dataset.num_image_writer_threads_per_camera=1 \
+    --policy.path=/data/tfj/lerobot_tfj/pi_model/pretrained_model \
+    --policy.device=cuda \
+    --policy.use_amp=false \
+    --policy.dtype=float32 \
+    --policy.n_action_steps=1 \
+    --policy.num_inference_steps=10 \
+    --display_data=false \
+    --play_sounds=false
+
+
+
+lerobot-record \
+  --robot.type=so101_follower \
+  --robot.port=/dev/ttyACM0 \
+  --robot.cameras="{ top: {type: opencv, index_or_path: 4, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, wrist: {type: opencv, index_or_path: 6, width: 640, height: 480, fps: 30,fourcc: "MJPG"}}" \
+  --robot.id=so101_follower \
+  --display_data=false \
+  --dataset.repo_id=local/eval_pi05_so101_debug \
+  --dataset.single_task="Clean the desk" \
+  --policy.path=/data/tfj/lerobot_tfj/pi_model/pretrained_model

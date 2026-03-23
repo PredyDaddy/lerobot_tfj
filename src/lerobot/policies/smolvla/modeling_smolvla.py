@@ -64,6 +64,7 @@ from typing_extensions import Unpack
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.policies.smolvla.rl_types import SmolVLAActionChunkPrediction, SmolVLAPrefixContext
 from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
 from lerobot.policies.utils import (
     populate_queues,
@@ -270,6 +271,15 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def get_optim_params(self) -> dict:
         return self.parameters()
 
+    def _extract_model_inputs(
+        self, batch: dict[str, Tensor]
+    ) -> tuple[list[Tensor], list[Tensor], Tensor, Tensor, Tensor]:
+        images, img_masks = self.prepare_images(batch)
+        state = self.prepare_state(batch)
+        lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
+        lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        return images, img_masks, lang_tokens, lang_masks, state
+
     def _get_action_chunk(
         self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs: Unpack[ActionSelectKwargs]
     ) -> Tensor:
@@ -282,10 +292,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             if k in self._queues and k != ACTION:
                 batch[k] = torch.stack(list(self._queues[k]), dim=1)
 
-        images, img_masks = self.prepare_images(batch)
-        state = self.prepare_state(batch)
-        lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
-        lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        images, img_masks, lang_tokens, lang_masks, state = self._extract_model_inputs(batch)
 
         actions = self.model.sample_actions(
             images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
@@ -317,6 +324,31 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         actions = self._get_action_chunk(batch, noise, **kwargs)
         return actions
+
+    @torch.no_grad()
+    def predict_action_chunk_with_info(
+        self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs: Unpack[ActionSelectKwargs]
+    ) -> SmolVLAActionChunkPrediction:
+        self.eval()
+
+        batch = self._prepare_batch(batch)
+        self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
+        images, img_masks, lang_tokens, lang_masks, state = self._extract_model_inputs(batch)
+        prediction = self.model.sample_actions_with_info(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            noise=noise,
+            **kwargs,
+        )
+        prediction.actions = prediction.actions[:, :, : self.config.action_feature.shape[0]]
+
+        if self.config.adapt_to_pi_aloha:
+            prediction.actions = self._pi_aloha_encode_actions(prediction.actions)
+
+        return prediction
 
     @torch.no_grad()
     def select_action(
@@ -351,6 +383,24 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
+
+    def get_value(self, batch: dict[str, Tensor]) -> Tensor:
+        batch = self._prepare_batch(batch)
+        images, img_masks, lang_tokens, lang_masks, state = self._extract_model_inputs(batch)
+        return self.model.get_value(images, img_masks, lang_tokens, lang_masks, state)
+
+    def compute_fm_score(self, batch: dict[str, Tensor], noisy_actions: Tensor, timestep: Tensor) -> Tensor:
+        batch = self._prepare_batch(batch)
+        images, img_masks, lang_tokens, lang_masks, state = self._extract_model_inputs(batch)
+        return self.model.compute_fm_score(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            noisy_actions=noisy_actions,
+            timestep=timestep,
+        )
 
     def forward(self, batch: dict[str, Tensor], noise=None, time=None) -> dict[str, Tensor]:
         """Do a full training forward pass to compute the loss"""
@@ -540,6 +590,7 @@ class VLAFlowMatching(nn.Module):
         self.action_time_mlp_out = nn.Linear(
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
+        self.value_head = self._make_value_head()
 
         self.set_requires_grad()
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
@@ -555,6 +606,24 @@ class VLAFlowMatching(nn.Module):
 
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
+
+    def _make_value_head(self) -> nn.Sequential:
+        layers: list[nn.Module] = []
+        input_dim = self.vlm_with_expert.config.text_config.hidden_size
+
+        if self.config.value_head_num_layers == 1:
+            return nn.Sequential(nn.Linear(input_dim, 1))
+
+        for layer_idx in range(self.config.value_head_num_layers - 1):
+            hidden_dim = self.config.value_head_hidden_dim
+            layers.append(nn.Linear(input_dim, hidden_dim))
+            layers.append(nn.SiLU())
+            if self.config.value_head_dropout > 0:
+                layers.append(nn.Dropout(self.config.value_head_dropout))
+            input_dim = hidden_dim
+
+        layers.append(nn.Linear(input_dim, 1))
+        return nn.Sequential(*layers)
 
     def set_requires_grad(self):
         for params in self.state_proj.parameters():
@@ -575,6 +644,124 @@ class VLAFlowMatching(nn.Module):
         time_beta = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
         time = time_beta * 0.999 + 0.001
         return time
+
+    def _pool_prefix_hidden_states(self, prefix_hidden_states: Tensor, prefix_pad_masks: Tensor) -> Tensor:
+        if self.config.value_head_pooling == "last":
+            last_indices = prefix_pad_masks.long().sum(dim=1).clamp(min=1) - 1
+            batch_indices = torch.arange(prefix_hidden_states.shape[0], device=prefix_hidden_states.device)
+            return prefix_hidden_states[batch_indices, last_indices]
+
+        valid_mask = prefix_pad_masks.to(dtype=prefix_hidden_states.dtype).unsqueeze(-1)
+        return (prefix_hidden_states * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1.0)
+
+    def encode_prefix_context(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        *,
+        use_cache: bool = False,
+    ) -> SmolVLAPrefixContext:
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        outputs_embeds, past_key_values = self.vlm_with_expert.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=use_cache,
+            # Prefix-only encoding has no expert suffix embeddings. For this stage we force
+            # self-attention path to avoid cross-attn expert branch consuming None inputs.
+            fill_kv_cache=True,
+        )
+        prefix_out = outputs_embeds[0]
+        if prefix_out is None:
+            raise RuntimeError("SmolVLA prefix encoding returned no prefix hidden states.")
+
+        return SmolVLAPrefixContext(
+            embeddings=prefix_embs,
+            pad_masks=prefix_pad_masks,
+            att_masks=prefix_att_masks,
+            hidden_states=prefix_out,
+            pooled_features=self._pool_prefix_hidden_states(prefix_out, prefix_pad_masks),
+            past_key_values=past_key_values if use_cache else None,
+        )
+
+    def get_value_from_prefix_context(self, prefix_context: SmolVLAPrefixContext) -> Tensor:
+        values = self.value_head(prefix_context.pooled_features.to(dtype=torch.float32))
+        return values.squeeze(-1)
+
+    def get_value(self, images, img_masks, lang_tokens, lang_masks, state) -> Tensor:
+        prefix_context = self.encode_prefix_context(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            use_cache=False,
+        )
+        return self.get_value_from_prefix_context(prefix_context)
+
+    def compute_fm_score_from_prefix_context(
+        self,
+        prefix_context: SmolVLAPrefixContext,
+        noisy_actions: Tensor,
+        timestep: Tensor,
+    ) -> Tensor:
+        if prefix_context.past_key_values is not None:
+            return self.denoise_step(
+                prefix_pad_masks=prefix_context.pad_masks,
+                past_key_values=prefix_context.past_key_values,
+                x_t=noisy_actions,
+                timestep=timestep,
+            )
+
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(noisy_actions, timestep)
+        pad_masks = torch.cat([prefix_context.pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_context.att_masks, suffix_att_masks], dim=1)
+
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        (_, suffix_out), _ = self.vlm_with_expert.forward(
+            attention_mask=att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_context.embeddings, suffix_embs],
+            use_cache=False,
+            fill_kv_cache=False,
+        )
+        if suffix_out is None:
+            raise RuntimeError("SmolVLA suffix encoding returned no suffix hidden states.")
+
+        suffix_out = suffix_out[:, -self.config.chunk_size :]
+        suffix_out = suffix_out.to(dtype=torch.float32)
+        return self.action_out_proj(suffix_out)
+
+    def compute_fm_score(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        *,
+        noisy_actions: Tensor,
+        timestep: Tensor,
+    ) -> Tensor:
+        prefix_context = self.encode_prefix_context(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            use_cache=False,
+        )
+        return self.compute_fm_score_from_prefix_context(prefix_context, noisy_actions, timestep)
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
@@ -762,6 +949,27 @@ class VLAFlowMatching(nn.Module):
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+        return self.sample_actions_with_info(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            noise=noise,
+            **kwargs,
+        ).actions
+
+    def sample_actions_with_info(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        noise=None,
+        **kwargs: Unpack[ActionSelectKwargs],
+    ) -> SmolVLAActionChunkPrediction:
+        """Do a full inference forward and return both the action chunk and RL-side diagnostics."""
         bsize = state.shape[0]
         device = state.device
 
@@ -769,25 +977,21 @@ class VLAFlowMatching(nn.Module):
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
-        )
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        # Compute image and language key value cache
-        _, past_key_values = self.vlm_with_expert.forward(
-            attention_mask=prefix_att_2d_masks,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
+        prefix_context = self.encode_prefix_context(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
             use_cache=self.config.use_cache,
-            fill_kv_cache=True,
         )
+        values = self.get_value_from_prefix_context(prefix_context)
         dt = -1.0 / self.config.num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        last_v_t = None
 
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
@@ -795,10 +999,9 @@ class VLAFlowMatching(nn.Module):
             # Define a closure function to properly capture expanded_time
             # This avoids the lambda expression (E731) and loop variable binding (B023) issues
             def denoise_step_partial_call(input_x_t, current_timestep=expanded_time):
-                return self.denoise_step(
-                    x_t=input_x_t,
-                    prefix_pad_masks=prefix_pad_masks,
-                    past_key_values=past_key_values,
+                return self.compute_fm_score_from_prefix_context(
+                    prefix_context,
+                    noisy_actions=input_x_t,
                     timestep=current_timestep,
                 )
 
@@ -820,6 +1023,7 @@ class VLAFlowMatching(nn.Module):
 
             # Euler step
             x_t += dt * v_t
+            last_v_t = v_t
 
             # Record x_t and v_t after Euler step (other params are recorded in rtc_processor.denoise_step)
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
@@ -827,7 +1031,13 @@ class VLAFlowMatching(nn.Module):
 
             time += dt
 
-        return x_t
+        return SmolVLAActionChunkPrediction(
+            actions=x_t,
+            value=values,
+            noise=noise,
+            prefix_features=prefix_context.pooled_features,
+            predicted_flow=last_v_t,
+        )
 
     def denoise_step(
         self,

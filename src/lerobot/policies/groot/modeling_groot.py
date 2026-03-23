@@ -87,31 +87,111 @@ class GrootPolicy(PreTrainedPolicy):
 
     def reset(self):
         """Reset policy state when environment resets."""
-        self._action_queue = deque([], maxlen=self.config.n_action_steps)
+        self._action_queue = deque([], maxlen=self.config.n_action_steps_effective)
 
     def get_optim_params(self) -> dict:
         return self.parameters()
+
+    def _build_groot_inputs(self, batch: dict[str, Tensor], *, include_action: bool) -> dict[str, Tensor]:
+        allowed_base = {"state", "state_mask", "embodiment_id"}
+        if include_action:
+            allowed_base.update({"action", "action_mask"})
+        return {
+            key: value
+            for key, value in batch.items()
+            if (key in allowed_base or key.startswith("eagle_")) and not (key.startswith("next.") or key == "info")
+        }
+
+    def get_hybrid_context(self, batch: dict[str, Tensor]):
+        groot_inputs = self._build_groot_inputs(batch, include_action=False)
+        device = next(self.parameters()).device
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=self.config.use_bf16):
+            return self._groot_model.get_hybrid_context(groot_inputs)
+
+    def forward_action_chunk(
+        self,
+        batch: dict[str, Tensor] | None = None,
+        *,
+        hybrid_context=None,
+        action_chunk: Tensor | None = None,
+        action_mask: Tensor | None = None,
+        noise: Tensor | None = None,
+        timesteps: Tensor | None = None,
+    ):
+        if hybrid_context is None:
+            if batch is None:
+                raise ValueError("Either `batch` or `hybrid_context` must be provided.")
+            hybrid_context = self.get_hybrid_context(batch)
+        if action_chunk is None:
+            if batch is None or "action" not in batch:
+                raise ValueError("`action_chunk` is required when `batch` does not contain `action`.")
+            action_chunk = batch["action"]
+        if action_mask is None and batch is not None:
+            action_mask = batch.get("action_mask")
+
+        device = next(self.parameters()).device
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=self.config.use_bf16):
+            return self._groot_model.forward_action_chunk(
+                hybrid_context,
+                actions=action_chunk,
+                action_mask=action_mask,
+                noise=noise,
+                timesteps=timesteps,
+            )
+
+    def predict_action_chunk_from_context(
+        self,
+        hybrid_context,
+        *,
+        noise: Tensor | None = None,
+        num_inference_timesteps: int | None = None,
+    ) -> Tensor:
+        device = next(self.parameters()).device
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=self.config.use_bf16):
+            outputs = self._groot_model.predict_action_chunk_from_context(
+                hybrid_context,
+                noise=noise,
+                num_inference_timesteps=num_inference_timesteps,
+            )
+
+        actions = outputs.get("action_pred")
+        original_action_dim = self.config.output_features["action"].shape[0]
+        return actions[:, :, :original_action_dim]
+
+    def get_value_from_hybrid_context(self, hybrid_context) -> Tensor:
+        value_fn = getattr(self._groot_model, "get_value_from_hybrid_context", None)
+        if not callable(value_fn):
+            value_fn = getattr(self._groot_model, "get_value_from_context", None)
+        if not callable(value_fn):
+            raise AttributeError(
+                "Underlying GROOT model does not expose `get_value_from_hybrid_context` or `get_value_from_context`."
+            )
+
+        device = next(self.parameters()).device
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=self.config.use_bf16):
+            values = value_fn(hybrid_context)
+        if not isinstance(values, Tensor):
+            values = torch.as_tensor(values, device=device)
+        else:
+            values = values.to(device=device)
+        return values.view(-1)
+
+    def predict_value(self, batch: dict[str, Tensor]) -> Tensor:
+        hybrid_context = self.get_hybrid_context(batch)
+        return self.get_value_from_hybrid_context(hybrid_context)
+
+    def get_value(self, batch: dict[str, Tensor]) -> Tensor:
+        return self.predict_value(batch)
+
+    def value(self, batch: dict[str, Tensor]) -> Tensor:
+        return self.predict_value(batch)
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Training forward pass.
 
         Delegates to Isaac-GR00T model.forward when inputs are compatible.
         """
-        # Build a clean input dict for GR00T: keep only tensors GR00T consumes
-        allowed_base = {"state", "state_mask", "action", "action_mask", "embodiment_id"}
-        groot_inputs = {
-            k: v
-            for k, v in batch.items()
-            if (k in allowed_base or k.startswith("eagle_")) and not (k.startswith("next.") or k == "info")
-        }
-
-        # Get device from model parameters
-        device = next(self.parameters()).device
-
-        # Run GR00T forward under bf16 autocast when enabled to reduce activation memory
-        # Rationale: Matches original GR00T finetuning (bf16 compute, fp32 params) and avoids fp32 upcasts.
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=self.config.use_bf16):
-            outputs = self._groot_model.forward(groot_inputs)
+        outputs = self.forward_action_chunk(batch)
 
         # Isaac-GR00T returns a BatchFeature; loss key is typically 'loss'
         loss = outputs.get("loss")
@@ -127,30 +207,8 @@ class GrootPolicy(PreTrainedPolicy):
         Returns a tensor of shape (B, n_action_steps, action_dim).
         """
         self.eval()
-
-        # Build a clean input dict for GR00T: keep only tensors GR00T consumes
-        # Preprocessing is handled by the processor pipeline, so we just filter the batch
-        # NOTE: During inference, we should NOT pass action/action_mask (that's what we're predicting)
-        allowed_base = {"state", "state_mask", "embodiment_id"}
-        groot_inputs = {
-            k: v
-            for k, v in batch.items()
-            if (k in allowed_base or k.startswith("eagle_")) and not (k.startswith("next.") or k == "info")
-        }
-
-        # Get device from model parameters
-        device = next(self.parameters()).device
-
-        # Use bf16 autocast for inference to keep memory low and match backbone dtype
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=self.config.use_bf16):
-            outputs = self._groot_model.get_action(groot_inputs)
-
-        actions = outputs.get("action_pred")
-
-        original_action_dim = self.config.output_features["action"].shape[0]
-        actions = actions[:, :, :original_action_dim]
-
-        return actions
+        hybrid_context = self.get_hybrid_context(batch)
+        return self.predict_action_chunk_from_context(hybrid_context)
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -158,7 +216,7 @@ class GrootPolicy(PreTrainedPolicy):
         self.eval()
 
         if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(batch)
+            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps_effective]
             self._action_queue.extend(actions.transpose(0, 1))
         return self._action_queue.popleft()
 

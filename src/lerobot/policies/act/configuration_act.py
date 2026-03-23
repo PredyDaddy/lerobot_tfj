@@ -19,6 +19,123 @@ from pathlib import Path
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
+from lerobot.policies.act.distillation_utils import get_kd_segment_layout
+
+
+@dataclass
+class ACTDecoderProjectionConfig:
+    enabled: bool = False
+    # Keep these as plain strings so repo-native draccus reload paths remain compatible.
+    kind: str = "linear"
+    placement: str = "student_only"
+    output_dim: int | None = None
+    bias: bool = False
+
+    def __post_init__(self) -> None:
+        if self.kind != "linear":
+            raise ValueError(f"`decoder_kd.projection.kind` must be `linear`. Got {self.kind}.")
+        if self.placement != "student_only":
+            raise ValueError(
+                "`decoder_kd.projection.placement` must be `student_only`. "
+                f"Got {self.placement}."
+            )
+        if self.output_dim is not None and self.output_dim <= 0:
+            raise ValueError(
+                "`decoder_kd.projection.output_dim` must be strictly positive when provided. "
+                f"Got {self.output_dim}."
+            )
+
+
+@dataclass
+class ACTDecoderKDConfig:
+    enabled: bool = False
+    peak_weight: float = 0.0
+    # Keep Stage-2 enum-like fields as plain strings so `save_pretrained` / `from_pretrained`
+    # and `TrainPipelineConfig.from_pretrained(...)` can round-trip through draccus.
+    loss_type: str = "smooth_l1"
+    smooth_l1_beta: float = 1.0
+    latent_mode: str = "zero"
+    overlap_steps: int | None = None
+    temporal_decay: float | None = None
+    prefix_weight: float | None = None
+    tail_weight: float | None = None
+    require_action_kd: bool = True
+    start_step: int = 0
+    ramp_steps: int = 0
+    anneal_start_step: int | None = None
+    end_step: int | None = None
+    enable_noise_gate: bool = True
+    enable_grad_gate: bool = True
+    log_grad_ratio: bool = False
+    projection: ACTDecoderProjectionConfig | None = None
+
+    def __post_init__(self) -> None:
+        if self.peak_weight < 0:
+            raise ValueError(
+                f"`decoder_kd.peak_weight` must be non-negative. Got {self.peak_weight}."
+            )
+        if self.loss_type not in {"smooth_l1", "mse"}:
+            raise ValueError(
+                "`decoder_kd.loss_type` must be one of `smooth_l1` or `mse`. "
+                f"Got {self.loss_type}."
+            )
+        if self.smooth_l1_beta <= 0:
+            raise ValueError(
+                f"`decoder_kd.smooth_l1_beta` must be strictly positive. Got {self.smooth_l1_beta}."
+            )
+        if self.latent_mode != "zero":
+            raise ValueError(
+                f"`decoder_kd.latent_mode` is frozen to `zero` for Stage-2 v1. Got {self.latent_mode}."
+            )
+        if self.overlap_steps is not None and self.overlap_steps <= 0:
+            raise ValueError(
+                "`decoder_kd.overlap_steps` must be strictly positive when provided. "
+                f"Got {self.overlap_steps}."
+            )
+        if self.temporal_decay is not None and self.temporal_decay < 0:
+            raise ValueError(
+                "`decoder_kd.temporal_decay` must be non-negative when provided. "
+                f"Got {self.temporal_decay}."
+            )
+        if self.prefix_weight is not None and self.prefix_weight < 0:
+            raise ValueError(
+                "`decoder_kd.prefix_weight` must be non-negative when provided. "
+                f"Got {self.prefix_weight}."
+            )
+        if self.tail_weight is not None and self.tail_weight < 0:
+            raise ValueError(
+                "`decoder_kd.tail_weight` must be non-negative when provided. "
+                f"Got {self.tail_weight}."
+            )
+        if self.prefix_weight == 0 and self.tail_weight == 0:
+            raise ValueError(
+                "At least one of `decoder_kd.prefix_weight` or `decoder_kd.tail_weight` must be positive."
+            )
+        if self.start_step < 0:
+            raise ValueError(f"`decoder_kd.start_step` must be non-negative. Got {self.start_step}.")
+        if self.ramp_steps < 0:
+            raise ValueError(f"`decoder_kd.ramp_steps` must be non-negative. Got {self.ramp_steps}.")
+        if self.anneal_start_step is not None and self.anneal_start_step < 0:
+            raise ValueError(
+                "`decoder_kd.anneal_start_step` must be non-negative when provided. "
+                f"Got {self.anneal_start_step}."
+            )
+        if self.end_step is not None and self.end_step < 0:
+            raise ValueError(
+                f"`decoder_kd.end_step` must be non-negative when provided. Got {self.end_step}."
+            )
+        if self.anneal_start_step is not None and self.anneal_start_step < self.start_step + self.ramp_steps:
+            raise ValueError(
+                "`decoder_kd.anneal_start_step` must be greater than or equal to "
+                "`start_step + ramp_steps`."
+            )
+        if self.end_step is not None:
+            min_end_step = self.anneal_start_step if self.anneal_start_step is not None else self.start_step
+            if self.end_step < min_end_step:
+                raise ValueError(
+                    "`decoder_kd.end_step` must be greater than or equal to the last active schedule boundary. "
+                    f"Got end_step={self.end_step}, minimum={min_end_step}."
+                )
 
 
 @PreTrainedConfig.register_subclass("act")
@@ -139,7 +256,13 @@ class ACTConfig(PreTrainedConfig):
     kd_weight: float = 1.0
     kd_overlap_steps: int | None = None
     kd_temporal_decay: float = 0.0
+    kd_strict_processor_compatibility: bool = True
+    kd_prefix_weight: float = 1.0
+    kd_tail_weight: float = 1.0
+    # Legacy field for Phase-1 / existing worktree compatibility only.
+    # Stage-2 canonical decoder feature dimension remains `dim_model`.
     decoder_out_dim: int = 1024
+    decoder_kd: ACTDecoderKDConfig = field(default_factory=ACTDecoderKDConfig)
 
     # Training preset
     optimizer_lr: float = 1e-5
@@ -148,6 +271,23 @@ class ACTConfig(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
+
+        if isinstance(self.decoder_kd, dict):
+            self.decoder_kd = ACTDecoderKDConfig(**self.decoder_kd)
+        elif not isinstance(self.decoder_kd, ACTDecoderKDConfig):
+            raise TypeError(
+                "`decoder_kd` must be an `ACTDecoderKDConfig` or a dict compatible with it. "
+                f"Got {type(self.decoder_kd)}."
+            )
+        if isinstance(self.decoder_kd.projection, dict):
+            self.decoder_kd.projection = ACTDecoderProjectionConfig(**self.decoder_kd.projection)
+        elif self.decoder_kd.projection is not None and not isinstance(
+            self.decoder_kd.projection, ACTDecoderProjectionConfig
+        ):
+            raise TypeError(
+                "`decoder_kd.projection` must be an `ACTDecoderProjectionConfig` or a dict compatible with it. "
+                f"Got {type(self.decoder_kd.projection)}."
+            )
 
         """Input validation (not exhaustive)."""
         if not self.vision_backbone.startswith("resnet"):
@@ -173,6 +313,10 @@ class ACTConfig(PreTrainedConfig):
                 raise ValueError(
                     "When `kd=True`, please set `teacher_policy_path` (preferred) or `teacher_train_config`."
                 )
+            if not self.kd_strict_processor_compatibility:
+                raise NotImplementedError(
+                    "Stage 1 ACT KD only supports strict processor-compatible normalized-action-space KD."
+                )
             if self.kd_weight <= 0:
                 raise ValueError(f"`kd_weight` must be strictly positive. Got {self.kd_weight}.")
             if self.kd_overlap_steps is not None and self.kd_overlap_steps <= 0:
@@ -183,6 +327,53 @@ class ACTConfig(PreTrainedConfig):
                 raise ValueError(
                     f"`kd_temporal_decay` must be non-negative. Got {self.kd_temporal_decay}."
                 )
+            if self.kd_prefix_weight < 0:
+                raise ValueError(
+                    f"`kd_prefix_weight` must be non-negative. Got {self.kd_prefix_weight}."
+                )
+            if self.kd_tail_weight < 0:
+                raise ValueError(
+                    f"`kd_tail_weight` must be non-negative. Got {self.kd_tail_weight}."
+                )
+            if self.kd_prefix_weight == 0 and self.kd_tail_weight == 0:
+                raise ValueError("At least one of `kd_prefix_weight` or `kd_tail_weight` must be positive.")
+            max_overlap_steps = self.chunk_size
+            if self.kd_overlap_steps is not None:
+                max_overlap_steps = min(max_overlap_steps, self.kd_overlap_steps)
+            get_kd_segment_layout(
+                overlap_steps=max_overlap_steps,
+                n_action_steps=self.n_action_steps,
+                kd_prefix_weight=self.kd_prefix_weight,
+                kd_tail_weight=self.kd_tail_weight,
+            )
+        if self.decoder_kd.enabled:
+            if self.decoder_kd.require_action_kd and not self.kd:
+                raise ValueError(
+                    "Stage-2 `decoder_kd` requires Phase-1 action KD to be enabled when "
+                    "`decoder_kd.require_action_kd=True`."
+                )
+            if self.decoder_kd.peak_weight <= 0:
+                raise ValueError(
+                    "When `decoder_kd.enabled=True`, `decoder_kd.peak_weight` must be strictly positive. "
+                    f"Got {self.decoder_kd.peak_weight}."
+                )
+
+            effective_overlap_steps = self.chunk_size
+            if self.decoder_kd.overlap_steps is not None:
+                effective_overlap_steps = min(effective_overlap_steps, self.decoder_kd.overlap_steps)
+
+            effective_prefix_weight = (
+                self.decoder_kd.prefix_weight if self.decoder_kd.prefix_weight is not None else self.kd_prefix_weight
+            )
+            effective_tail_weight = (
+                self.decoder_kd.tail_weight if self.decoder_kd.tail_weight is not None else self.kd_tail_weight
+            )
+            get_kd_segment_layout(
+                overlap_steps=effective_overlap_steps,
+                n_action_steps=self.n_action_steps,
+                kd_prefix_weight=effective_prefix_weight,
+                kd_tail_weight=effective_tail_weight,
+            )
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(

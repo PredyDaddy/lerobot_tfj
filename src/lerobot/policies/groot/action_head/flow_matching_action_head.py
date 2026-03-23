@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F  # noqa: N812
-from torch import nn
+from torch import Tensor, nn
 from torch.distributions import Beta
 
 from lerobot.utils.import_utils import _transformers_available
@@ -37,6 +37,17 @@ from lerobot.policies.groot.action_head.action_encoder import (
 )
 
 from .cross_attention_dit import DiT, SelfAttentionTransformer
+
+BACKBONE_FEATURES_KEY = "backbone_features"
+BACKBONE_ATTENTION_MASK_KEY = "backbone_attention_mask"
+STATE_FEATURES_KEY = "state_features"
+FUTURE_TOKENS_KEY = "future_tokens"
+EMBODIMENT_ID_KEY = "embodiment_id"
+ACTION_MASK_KEY = "action_mask"
+NOISY_ACTION_KEY = "noisy_action"
+PREDICTED_VELOCITY_KEY = "pred_velocity"
+TARGET_VELOCITY_KEY = "target_velocity"
+TIMESTEP_BUCKET_KEY = "timestep_bucket"
 
 
 class CategorySpecificLinear(nn.Module):
@@ -257,145 +268,298 @@ class FlowmatchingActionHead(nn.Module):
         return BatchFeature(data=batch)
 
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
-        backbone_features = backbone_output["backbone_features"]
+        processed_backbone_output = BatchFeature(data=dict(backbone_output))
+        backbone_features = processed_backbone_output[BACKBONE_FEATURES_KEY]
         backbone_features = self.vlln(backbone_features)
         backbone_features = self.vl_self_attention(backbone_features)
-        backbone_output["backbone_features"] = backbone_features
-        return backbone_output
+        processed_backbone_output[BACKBONE_FEATURES_KEY] = backbone_features
+        return processed_backbone_output
 
-    def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
-        # Set frozen modules to eval
+    def _expand_batch_feature(self, batch_feature: BatchFeature) -> BatchFeature:
+        if self.config.expand_batch is None:
+            return BatchFeature(data=dict(batch_feature))
+
+        expanded_data = {}
+        for key, value in batch_feature.items():
+            if not isinstance(value, Tensor):
+                expanded_data[key] = value
+                continue
+            factors = (self.config.expand_batch, *([1] * (value.ndim - 1)))
+            expanded_data[key] = value.repeat(*factors)
+        return BatchFeature(data=expanded_data)
+
+    def build_context(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
 
-        backbone_output = self.process_backbone_output(backbone_output)
+        processed_backbone_output = self.process_backbone_output(backbone_output)
+        processed_backbone_output = self._expand_batch_feature(processed_backbone_output)
+        expanded_action_input = self._expand_batch_feature(action_input)
 
-        if self.config.expand_batch is not None:
-            for k, v in backbone_output.items():
-                ndim = len(v.shape)
-                factors = [self.config.expand_batch]
-                while len(factors) < ndim:
-                    factors.append(1)
-                factors = tuple(factors)
-                expanded = v.repeat(*factors)
-                backbone_output[k] = expanded
+        backbone_features = processed_backbone_output[BACKBONE_FEATURES_KEY]
+        embodiment_id = expanded_action_input[EMBODIMENT_ID_KEY]
+        state_features = self.state_encoder(expanded_action_input["state"], embodiment_id)
+        future_tokens = self.future_tokens.weight.unsqueeze(0).expand(backbone_features.shape[0], -1, -1)
 
-            for k, v in action_input.items():
-                ndim = len(v.shape)
-                factors = [self.config.expand_batch]
-                while len(factors) < ndim:
-                    factors.append(1)
-                factors = tuple(factors)
-                expanded = v.repeat(*factors)
-                action_input[k] = expanded
+        context_data = {
+            BACKBONE_FEATURES_KEY: backbone_features,
+            STATE_FEATURES_KEY: state_features,
+            FUTURE_TOKENS_KEY: future_tokens,
+            EMBODIMENT_ID_KEY: embodiment_id,
+        }
+        backbone_attention_mask = processed_backbone_output.get(BACKBONE_ATTENTION_MASK_KEY)
+        if backbone_attention_mask is not None:
+            context_data[BACKBONE_ATTENTION_MASK_KEY] = backbone_attention_mask
+        return BatchFeature(data=context_data)
 
-        # Get vision and language embeddings.
-        vl_embs = backbone_output.backbone_features
-        device = vl_embs.device
+    def _normalize_action_mask(self, action_mask: Tensor, action_shape: tuple[int, int, int]) -> Tensor:
+        if action_mask.ndim == 2:
+            action_mask = action_mask.unsqueeze(-1)
+        if action_mask.ndim != 3:
+            raise ValueError(
+                "action_mask must be rank-2 or rank-3 with shape compatible with actions. "
+                f"Got ndim={action_mask.ndim} and shape={tuple(action_mask.shape)}."
+            )
+        if action_mask.shape[0] != action_shape[0] or action_mask.shape[1] != action_shape[1]:
+            raise ValueError(
+                "action_mask batch/time dimensions must match actions before chunk normalization. "
+                f"Got action_mask shape={tuple(action_mask.shape)} and actions shape={action_shape}."
+            )
+        if action_mask.shape[2] == 1 and action_shape[2] != 1:
+            action_mask = action_mask.expand(-1, -1, action_shape[2])
+        elif action_mask.shape[2] != action_shape[2]:
+            raise ValueError(
+                "action_mask feature dimension must either match actions or be singleton for broadcasting. "
+                f"Got action_mask shape={tuple(action_mask.shape)} and actions shape={action_shape}."
+            )
+        return action_mask
 
-        # Get embodiment ID.
-        embodiment_id = action_input.embodiment_id
+    def normalize_action_chunk(
+        self,
+        actions: Tensor,
+        action_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        if actions.ndim == 2:
+            actions = actions.unsqueeze(1)
+        elif actions.ndim != 3:
+            raise ValueError(
+                "actions must be rank-2 or rank-3 tensors shaped as (B, D) or (B, T, D). "
+                f"Got ndim={actions.ndim} and shape={tuple(actions.shape)}."
+            )
+        if actions.shape[1] == 0 or actions.shape[2] == 0:
+            raise ValueError(f"actions must have non-zero chunk and feature dimensions. Got shape={tuple(actions.shape)}.")
 
-        # Embed state.
-        state_features = self.state_encoder(action_input.state, embodiment_id)
+        batch_size, chunk_size, action_dim = actions.shape
+        if action_mask is None:
+            action_mask = torch.ones(batch_size, chunk_size, action_dim, dtype=torch.bool, device=actions.device)
+        else:
+            action_mask = self._normalize_action_mask(action_mask.to(device=actions.device), tuple(actions.shape))
 
-        # Embed noised action trajectory.
-        actions = action_input.action
-        noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
-        t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
-        t = t[:, None, None]  # shape (B,1,1) for broadcast
+        if chunk_size < self.action_horizon:
+            pad_steps = self.action_horizon - chunk_size
+            last_action = actions[:, -1:, :]
+            actions = torch.cat([actions, last_action.expand(-1, pad_steps, -1)], dim=1)
+            action_mask = torch.cat(
+                [action_mask, action_mask.new_zeros(batch_size, pad_steps, action_mask.shape[2])],
+                dim=1,
+            )
+        elif chunk_size > self.action_horizon:
+            actions = actions[:, : self.action_horizon]
+            action_mask = action_mask[:, : self.action_horizon]
 
-        noisy_trajectory = (1 - t) * noise + t * actions
-        velocity = actions - noise
+        if action_dim < self.action_dim:
+            pad_dims = self.action_dim - action_dim
+            actions = torch.cat(
+                [actions, actions.new_zeros(batch_size, actions.shape[1], pad_dims)],
+                dim=2,
+            )
+            action_mask = torch.cat(
+                [action_mask, action_mask.new_zeros(batch_size, action_mask.shape[1], pad_dims)],
+                dim=2,
+            )
+        elif action_dim > self.action_dim:
+            actions = actions[:, :, : self.action_dim]
+            action_mask = action_mask[:, :, : self.action_dim]
 
-        # Convert (continuous) t -> discrete if needed
-        t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
-        action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
+        return actions, action_mask
 
-        # Maybe add position embedding.
+    def _resolve_timesteps(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        timesteps: Tensor | None,
+    ) -> tuple[Tensor, Tensor]:
+        if timesteps is None:
+            continuous_timesteps = self.sample_time(batch_size, device=device, dtype=dtype)
+        else:
+            timesteps = timesteps.to(device=device)
+            if timesteps.numel() == 1:
+                first_timestep = timesteps.reshape(1).expand(batch_size)
+            else:
+                if timesteps.shape[0] != batch_size:
+                    raise ValueError(
+                        "timesteps batch dimension must match actions. "
+                        f"Got timesteps shape={tuple(timesteps.shape)} and batch_size={batch_size}."
+                    )
+                first_timestep = timesteps.reshape(batch_size, -1)[:, 0]
+            if torch.is_floating_point(first_timestep):
+                continuous_timesteps = first_timestep.to(dtype=dtype).clamp(min=0.0, max=1.0)
+            else:
+                discrete_timesteps = first_timestep.to(dtype=torch.long)
+                discrete_timesteps = discrete_timesteps.clamp(min=0, max=self.num_timestep_buckets - 1)
+                continuous_timesteps = discrete_timesteps.to(dtype=dtype) / float(self.num_timestep_buckets)
+
+        discrete_timesteps = (continuous_timesteps * self.num_timestep_buckets).long()
+        discrete_timesteps = discrete_timesteps.clamp(min=0, max=self.num_timestep_buckets - 1)
+        continuous_timesteps = continuous_timesteps.clamp(min=0.0, max=1.0)
+        return continuous_timesteps[:, None, None], discrete_timesteps
+
+    def _encode_action_features(
+        self,
+        actions: Tensor,
+        timestep_buckets: Tensor,
+        embodiment_id: Tensor,
+        *,
+        device: torch.device,
+    ) -> Tensor:
+        action_features = self.action_encoder(actions, timestep_buckets, embodiment_id)
         if self.config.add_pos_embed:
             pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
             pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
             action_features = action_features + pos_embs
+        return action_features
 
-        # Join vision, language, state and action embedding along sequence dimension.
-        future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
-        sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+    def forward_chunk(
+        self,
+        context: BatchFeature,
+        *,
+        actions: Tensor,
+        action_mask: Tensor | None = None,
+        noise: Tensor | None = None,
+        timesteps: Tensor | None = None,
+    ) -> BatchFeature:
+        actions, action_mask = self.normalize_action_chunk(actions, action_mask)
+        if noise is None:
+            noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
+        elif noise.shape != actions.shape:
+            raise ValueError(f"noise must match normalized action shape {tuple(actions.shape)}, got {tuple(noise.shape)}.")
+        else:
+            noise = noise.to(device=actions.device, dtype=actions.dtype)
 
-        vl_attn_mask = backbone_output.backbone_attention_mask
+        continuous_timesteps, timestep_buckets = self._resolve_timesteps(
+            actions.shape[0],
+            device=actions.device,
+            dtype=actions.dtype,
+            timesteps=timesteps,
+        )
+        noisy_trajectory = (1 - continuous_timesteps) * noise + continuous_timesteps * actions
+        target_velocity = actions - noise
 
+        action_features = self._encode_action_features(
+            noisy_trajectory,
+            timestep_buckets,
+            context[EMBODIMENT_ID_KEY],
+            device=context[BACKBONE_FEATURES_KEY].device,
+        )
+        sa_embs = torch.cat(
+            (context[STATE_FEATURES_KEY], context[FUTURE_TOKENS_KEY], action_features),
+            dim=1,
+        )
         model_output = self.model(
             hidden_states=sa_embs,
-            encoder_hidden_states=vl_embs,
-            encoder_attention_mask=vl_attn_mask,
-            timestep=t_discretized,
-            return_all_hidden_states=False,  # NOTE (YL): not using flare now
+            encoder_hidden_states=context[BACKBONE_FEATURES_KEY],
+            encoder_attention_mask=context.get(BACKBONE_ATTENTION_MASK_KEY),
+            timestep=timestep_buckets,
+            return_all_hidden_states=False,
         )
-        pred = self.action_decoder(model_output, embodiment_id)
-        pred_actions = pred[:, -actions.shape[1] :]
+        pred = self.action_decoder(model_output, context[EMBODIMENT_ID_KEY])
+        pred_velocity = pred[:, -actions.shape[1] :]
 
-        # Slice out only the action portion of pred and target.
-        action_mask = action_input.action_mask
-        loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
-        loss = loss.sum() / action_mask.sum()
-        output_dict = {
-            "loss": loss,
-        }
+        loss = F.mse_loss(pred_velocity, target_velocity, reduction="none") * action_mask
+        loss = loss.sum() / action_mask.sum().clamp(min=1)
+        return BatchFeature(
+            data={
+                "loss": loss,
+                PREDICTED_VELOCITY_KEY: pred_velocity,
+                TARGET_VELOCITY_KEY: target_velocity,
+                NOISY_ACTION_KEY: noisy_trajectory,
+                ACTION_MASK_KEY: action_mask,
+                TIMESTEP_BUCKET_KEY: timestep_buckets,
+            }
+        )
+
+    @torch.no_grad()
+    def sample_actions_from_context(
+        self,
+        context: BatchFeature,
+        *,
+        noise: Tensor | None = None,
+        num_inference_timesteps: int | None = None,
+    ) -> BatchFeature:
+        backbone_features = context[BACKBONE_FEATURES_KEY]
+        batch_size = backbone_features.shape[0]
+        device = backbone_features.device
+
+        if noise is None:
+            actions = torch.randn(
+                size=(batch_size, self.action_horizon, self.action_dim),
+                dtype=backbone_features.dtype,
+                device=device,
+            )
+        else:
+            actions, _ = self.normalize_action_chunk(noise.to(device=device, dtype=backbone_features.dtype))
+
+        num_steps = num_inference_timesteps or self.num_inference_timesteps
+        if num_steps is None or num_steps <= 0:
+            raise ValueError(f"num_inference_timesteps must be positive, got {num_steps}.")
+        dt = 1.0 / num_steps
+
+        pred_velocity = None
+        for timestep_index in range(num_steps):
+            t_cont = timestep_index / float(num_steps)
+            timestep_bucket = int(t_cont * self.num_timestep_buckets)
+            timestep_bucket = min(timestep_bucket, self.num_timestep_buckets - 1)
+            timestep_tensor = torch.full(size=(batch_size,), fill_value=timestep_bucket, device=device)
+            action_features = self._encode_action_features(
+                actions,
+                timestep_tensor,
+                context[EMBODIMENT_ID_KEY],
+                device=device,
+            )
+            sa_embs = torch.cat(
+                (context[STATE_FEATURES_KEY], context[FUTURE_TOKENS_KEY], action_features),
+                dim=1,
+            )
+
+            # Preserve the warm-start inference path by matching the original call shape,
+            # which omitted encoder_attention_mask for denoising.
+            model_output = self.model(
+                hidden_states=sa_embs,
+                encoder_hidden_states=backbone_features,
+                timestep=timestep_tensor,
+            )
+            pred = self.action_decoder(model_output, context[EMBODIMENT_ID_KEY])
+            pred_velocity = pred[:, -self.action_horizon :]
+            actions = actions + dt * pred_velocity
+
+        output_dict = {"action_pred": actions}
+        if pred_velocity is not None:
+            output_dict[PREDICTED_VELOCITY_KEY] = pred_velocity
         return BatchFeature(data=output_dict)
+
+    def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
+        context = self.build_context(backbone_output, action_input)
+        return self.forward_chunk(
+            context,
+            actions=action_input["action"],
+            action_mask=action_input.get(ACTION_MASK_KEY),
+        )
 
     @torch.no_grad()
     def get_action(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
-        backbone_output = self.process_backbone_output(backbone_output)
-
-        # Get vision and language embeddings.
-        vl_embs = backbone_output.backbone_features
-        embodiment_id = action_input.embodiment_id
-
-        # Embed state.
-        state_features = self.state_encoder(action_input.state, embodiment_id)
-
-        # Set initial actions as the sampled noise.
-        batch_size = vl_embs.shape[0]
-        device = vl_embs.device
-        actions = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.config.action_dim),
-            dtype=vl_embs.dtype,
-            device=device,
-        )
-
-        num_steps = self.num_inference_timesteps
-        dt = 1.0 / num_steps
-
-        # Run denoising steps.
-        for t in range(num_steps):
-            t_cont = t / float(num_steps)  # e.g. goes 0, 1/N, 2/N, ...
-            t_discretized = int(t_cont * self.num_timestep_buckets)
-
-            # Embed noised action trajectory.
-            timesteps_tensor = torch.full(size=(batch_size,), fill_value=t_discretized, device=device)
-            action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
-            # Maybe add position embedding.
-            if self.config.add_pos_embed:
-                pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-                pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
-                action_features = action_features + pos_embs
-
-            # Join vision, language, state and action embedding along sequence dimension.
-            future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
-            sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
-
-            # Run model forward.
-            model_output = self.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embs,
-                timestep=timesteps_tensor,
-            )
-            pred = self.action_decoder(model_output, embodiment_id)
-
-            pred_velocity = pred[:, -self.action_horizon :]
-
-            # Update actions using euler integration.
-            actions = actions + dt * pred_velocity
-        return BatchFeature(data={"action_pred": actions})
+        context = self.build_context(backbone_output, action_input)
+        return self.sample_actions_from_context(context)
 
     @property
     def device(self):

@@ -24,6 +24,7 @@ from collections import deque
 from collections.abc import Callable
 from itertools import chain
 from pathlib import Path
+from typing import Literal
 
 import einops
 import numpy as np
@@ -35,7 +36,26 @@ from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
 from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.act.distillation_utils import (
+    ACTDecoderFeatureOutput,
+    ACTForwardWithFeaturesOutput,
+    ACTTeacherBundle,
+    DecoderKDGateBreakdown,
+    DecoderKDLossBreakdown,
+    DecoderKDRatioBreakdown,
+    KD_COMPARISON_SPACE_NORMALIZED_ACTION,
+    KDLossBreakdown,
+    compute_decoder_kd_gate,
+    compute_decoder_kd_loss,
+    compute_decoder_kd_ratios,
+    compute_noise_to_signal_ratio,
+    get_kd_segment_layout,
+    load_act_teacher_bundle,
+    masked_mean,
+    safe_ratio,
+)
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.processor import PolicyProcessorPipeline
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 
@@ -125,7 +145,8 @@ class ACTPolicy(PreTrainedPolicy):
         self.config = config
 
         self.model = ACT(config)
-        self.__dict__["_teacher_policy"] = None
+        self.__dict__["_teacher_bundle"] = None
+        self.register_buffer("_decoder_kd_step_buffer", torch.zeros((), dtype=torch.long), persistent=True)
 
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
@@ -164,7 +185,12 @@ class ACTPolicy(PreTrainedPolicy):
         batch[OBS_IMAGES] = [batch[key] for key in config.image_features]
         return batch
 
-    def _validate_teacher_policy(self, teacher_policy: "ACTPolicy") -> None:
+    def _validate_teacher_policy(
+        self,
+        teacher_policy: "ACTPolicy",
+        *,
+        processor_compatibility=None,
+    ) -> None:
         missing_inputs = [
             key for key in teacher_policy.config.input_features if key not in self.config.input_features
         ]
@@ -194,21 +220,62 @@ class ACTPolicy(PreTrainedPolicy):
                 f"Got teacher={teacher_action_feature.shape}, student={student_action_feature.shape}."
             )
 
-    def _get_teacher_policy(self) -> "ACTPolicy":
-        teacher_policy = self.__dict__.get("_teacher_policy")
-        if teacher_policy is None:
-            teacher_source = self.config.teacher_policy_path or self.config.teacher_train_config
-            if teacher_source is None:
-                raise RuntimeError("KD is enabled but no teacher path was provided.")
+        if self.config.kd_strict_processor_compatibility:
+            if processor_compatibility is None:
+                raise ValueError(
+                    "ACT KD requires an attached teacher bundle with a processor compatibility report."
+                )
+            processor_compatibility.require_compatible()
 
-            teacher_pretrained_path = _resolve_teacher_pretrained_path(teacher_source)
-            teacher_policy = ACTPolicy.from_pretrained(teacher_pretrained_path)
+    def attach_teacher_bundle(self, teacher_bundle: ACTTeacherBundle) -> None:
+        if not self.config.kd:
+            raise RuntimeError("Teacher bundles can only be attached when ACT KD is enabled.")
+        if teacher_bundle.comparison_space != KD_COMPARISON_SPACE_NORMALIZED_ACTION:
+            raise ValueError(
+                "Stage 1 ACT KD only supports `normalized_action_space` teacher bundles. "
+                f"Got `{teacher_bundle.comparison_space}`."
+            )
+
+        teacher_policy = teacher_bundle.policy
+        self._validate_teacher_policy(
+            teacher_policy,
+            processor_compatibility=teacher_bundle.processor_compatibility,
+        )
+        if hasattr(teacher_policy, "requires_grad_"):
             teacher_policy.requires_grad_(False)
+        if hasattr(teacher_policy, "eval"):
             teacher_policy.eval()
-            self._validate_teacher_policy(teacher_policy)
-            self.__dict__["_teacher_policy"] = teacher_policy
+        self.__dict__["_teacher_bundle"] = teacher_bundle
 
-        return teacher_policy
+    def load_and_attach_teacher_bundle(
+        self,
+        student_preprocessor: PolicyProcessorPipeline[dict[str, Tensor], dict[str, Tensor]],
+        teacher_pretrained_path: str | Path,
+    ) -> ACTTeacherBundle:
+        teacher_bundle = load_act_teacher_bundle(
+            student_policy=self,
+            student_preprocessor=student_preprocessor,
+            teacher_pretrained_path=teacher_pretrained_path,
+        )
+        self.attach_teacher_bundle(teacher_bundle)
+        return teacher_bundle
+
+    def _get_teacher_bundle(self) -> ACTTeacherBundle:
+        teacher_bundle = self.__dict__.get("_teacher_bundle")
+        if teacher_bundle is None:
+            raise RuntimeError(
+                "ACT KD requires `attach_teacher_bundle(...)` before training so processor compatibility "
+                "can be validated up front."
+            )
+        if teacher_bundle.comparison_space != KD_COMPARISON_SPACE_NORMALIZED_ACTION:
+            raise ValueError(
+                "Stage 1 ACT KD only supports `normalized_action_space` comparison. "
+                f"Got `{teacher_bundle.comparison_space}`."
+            )
+        return teacher_bundle
+
+    def _get_teacher_policy(self) -> "ACTPolicy":
+        return self._get_teacher_bundle().policy
 
     def _get_kd_temporal_weights(self, overlap_steps: int, device: torch.device, dtype: torch.dtype) -> Tensor:
         if self.config.kd_temporal_decay == 0:
@@ -218,7 +285,28 @@ class ACTPolicy(PreTrainedPolicy):
         weights = torch.exp(-self.config.kd_temporal_decay * positions)
         return weights / weights.mean()
 
-    def _compute_kd_loss(self, batch: dict[str, Tensor], actions_hat: Tensor) -> tuple[Tensor, int]:
+    def _get_kd_segment_weights(
+        self,
+        overlap_steps: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        segment_layout = get_kd_segment_layout(
+            overlap_steps=overlap_steps,
+            n_action_steps=self.config.n_action_steps,
+            kd_prefix_weight=self.config.kd_prefix_weight,
+            kd_tail_weight=self.config.kd_tail_weight,
+        )
+        weights = torch.full(
+            (overlap_steps,),
+            fill_value=self.config.kd_tail_weight,
+            device=device,
+            dtype=dtype,
+        )
+        weights[: segment_layout.prefix_steps] = self.config.kd_prefix_weight
+        return weights
+
+    def _compute_kd_loss(self, batch: dict[str, Tensor], actions_hat: Tensor) -> KDLossBreakdown:
         teacher_policy = self._get_teacher_policy()
         teacher_policy.to(actions_hat.device)
         teacher_actions = teacher_policy.predict_action_chunk(batch).to(
@@ -239,11 +327,39 @@ class ACTPolicy(PreTrainedPolicy):
         if action_is_pad is None:
             mask = torch.ones_like(kd_error)
         else:
-            mask = (~action_is_pad[:, :overlap_steps]).unsqueeze(-1).to(dtype=kd_error.dtype)
+            mask = (~action_is_pad[:, :overlap_steps]).unsqueeze(-1)
 
         temporal_weights = self._get_kd_temporal_weights(overlap_steps, kd_error.device, kd_error.dtype)
-        kd_loss = (kd_error * mask * temporal_weights.view(1, overlap_steps, 1)).mean()
-        return kd_loss, overlap_steps
+        segment_weights = self._get_kd_segment_weights(overlap_steps, kd_error.device, kd_error.dtype)
+        loss_weights = temporal_weights.view(1, overlap_steps, 1) * segment_weights.view(1, overlap_steps, 1)
+
+        kd_loss, _ = masked_mean(kd_error, mask, weights=loss_weights)
+        kd_masked_mean, kd_valid_ratio = masked_mean(kd_error, mask)
+
+        segment_layout = get_kd_segment_layout(
+            overlap_steps=overlap_steps,
+            n_action_steps=self.config.n_action_steps,
+            kd_prefix_weight=self.config.kd_prefix_weight,
+            kd_tail_weight=self.config.kd_tail_weight,
+        )
+        kd_prefix_l1_loss, _ = masked_mean(
+            kd_error[:, : segment_layout.prefix_steps], mask[:, : segment_layout.prefix_steps]
+        )
+        if segment_layout.tail_steps > 0:
+            kd_tail_l1_loss, _ = masked_mean(
+                kd_error[:, segment_layout.prefix_steps :], mask[:, segment_layout.prefix_steps :]
+            )
+        else:
+            kd_tail_l1_loss = kd_error.new_zeros(())
+
+        return KDLossBreakdown(
+            loss=kd_loss,
+            masked_mean=kd_masked_mean,
+            valid_ratio=kd_valid_ratio,
+            prefix_l1_loss=kd_prefix_l1_loss,
+            tail_l1_loss=kd_tail_l1_loss,
+            overlap_steps=overlap_steps,
+        )
 
     def reset(self):
         """This should be called whenever the environment is reset."""
@@ -287,6 +403,305 @@ class ACTPolicy(PreTrainedPolicy):
         actions = self.model(batch)[0]
         return actions
 
+    @torch.no_grad()
+    def get_decoder_features(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        latent_mode: Literal["zero", "posterior"] = "zero",
+    ) -> ACTDecoderFeatureOutput:
+        self.eval()
+
+        batch = self._prepare_batch_for_policy(batch)
+        forward_output = self.model.forward_with_features(
+            batch,
+            latent_mode=latent_mode,
+            return_decoder_out=True,
+        )
+        if forward_output.decoder_features is None:
+            raise RuntimeError("ACT forward_with_features(return_decoder_out=True) returned no decoder features.")
+        return forward_output.decoder_features
+
+    def _get_decoder_kd_config(self):
+        return getattr(self.config, "decoder_kd", None)
+
+    def _get_decoder_kd_overlap_steps(self):
+        decoder_kd = self._get_decoder_kd_config()
+        if decoder_kd is None:
+            return self.config.kd_overlap_steps
+        return decoder_kd.overlap_steps if decoder_kd.overlap_steps is not None else self.config.kd_overlap_steps
+
+    def _get_decoder_kd_temporal_decay(self) -> float:
+        decoder_kd = self._get_decoder_kd_config()
+        if decoder_kd is None or decoder_kd.temporal_decay is None:
+            return self.config.kd_temporal_decay
+        return decoder_kd.temporal_decay
+
+    def _get_decoder_kd_prefix_weight(self) -> float:
+        decoder_kd = self._get_decoder_kd_config()
+        if decoder_kd is None or decoder_kd.prefix_weight is None:
+            return self.config.kd_prefix_weight
+        return decoder_kd.prefix_weight
+
+    def _get_decoder_kd_tail_weight(self) -> float:
+        decoder_kd = self._get_decoder_kd_config()
+        if decoder_kd is None or decoder_kd.tail_weight is None:
+            return self.config.kd_tail_weight
+        return decoder_kd.tail_weight
+
+    def _get_decoder_kd_trunk_parameters(self) -> list[Tensor]:
+        trunk_parameters = []
+        for name, parameter in self.named_parameters():
+            if not parameter.requires_grad or not name.startswith("model."):
+                continue
+            # Keep ratios scoped to the shared ACT trunk and exclude output-only heads.
+            if name.startswith("model.action_head"):
+                continue
+            if name.startswith("model.vae_encoder") or name.startswith("model.vae_encoder_"):
+                continue
+            trunk_parameters.append(parameter)
+        return trunk_parameters
+
+    def _compute_decoder_kd_grad_norm(self, loss: Tensor, parameters: list[Tensor]) -> Tensor | None:
+        if not loss.requires_grad or not parameters:
+            return None
+
+        grads = torch.autograd.grad(loss, parameters, retain_graph=True, allow_unused=True)
+        squared_norm = None
+        for grad in grads:
+            if grad is None:
+                continue
+            grad_contribution = grad.detach().pow(2).sum()
+            squared_norm = grad_contribution if squared_norm is None else squared_norm + grad_contribution
+
+        if squared_norm is None:
+            return None
+        return squared_norm.sqrt()
+
+    def _compute_decoder_kd_grad_ratios(
+        self,
+        *,
+        scheduled_decoder_kd_loss: Tensor,
+        bc_loss: Tensor,
+        action_kd_loss: Tensor | None,
+    ) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
+        trunk_parameters = self._get_decoder_kd_trunk_parameters()
+        decoder_grad_norm = self._compute_decoder_kd_grad_norm(scheduled_decoder_kd_loss, trunk_parameters)
+        bc_grad_norm = self._compute_decoder_kd_grad_norm(bc_loss, trunk_parameters)
+
+        weighted_action_kd_loss = None
+        if action_kd_loss is not None:
+            weighted_action_kd_loss = action_kd_loss * self.config.kd_weight
+
+        action_grad_norm = (
+            self._compute_decoder_kd_grad_norm(weighted_action_kd_loss, trunk_parameters)
+            if weighted_action_kd_loss is not None
+            else None
+        )
+        behavior_loss = bc_loss if weighted_action_kd_loss is None else bc_loss + weighted_action_kd_loss
+        behavior_grad_norm = self._compute_decoder_kd_grad_norm(behavior_loss, trunk_parameters)
+
+        decoder_to_bc_grad_ratio = None
+        if decoder_grad_norm is not None and bc_grad_norm is not None:
+            decoder_to_bc_grad_ratio = safe_ratio(
+                decoder_grad_norm,
+                bc_grad_norm,
+                reference=decoder_grad_norm,
+                zero_denominator="infinity",
+            )
+
+        decoder_to_action_kd_grad_ratio = None
+        if decoder_grad_norm is not None and action_grad_norm is not None:
+            decoder_to_action_kd_grad_ratio = safe_ratio(
+                decoder_grad_norm,
+                action_grad_norm,
+                reference=decoder_grad_norm,
+                zero_denominator="infinity",
+            )
+
+        decoder_to_behavior_grad_ratio = None
+        if decoder_grad_norm is not None and behavior_grad_norm is not None:
+            decoder_to_behavior_grad_ratio = safe_ratio(
+                decoder_grad_norm,
+                behavior_grad_norm,
+                reference=decoder_grad_norm,
+                zero_denominator="infinity",
+            )
+
+        return (
+            decoder_to_bc_grad_ratio,
+            decoder_to_action_kd_grad_ratio,
+            decoder_to_behavior_grad_ratio,
+        )
+
+    def _get_decoder_kd_step(self) -> int:
+        step_buffer = getattr(self, "_decoder_kd_step_buffer", None)
+        if isinstance(step_buffer, Tensor):
+            return int(step_buffer.item())
+        return int(self.__dict__.get("_decoder_kd_step", 0))
+
+    def _advance_decoder_kd_step(self) -> None:
+        step_buffer = getattr(self, "_decoder_kd_step_buffer", None)
+        if isinstance(step_buffer, Tensor):
+            step_buffer.add_(1)
+            return
+        self.__dict__["_decoder_kd_step"] = self._get_decoder_kd_step() + 1
+
+    def _get_decoder_kd_scheduler_weight(self, step: int) -> float:
+        decoder_kd = self._get_decoder_kd_config()
+        if decoder_kd is None or not decoder_kd.enabled:
+            return 0.0
+
+        if step < decoder_kd.start_step:
+            return 0.0
+
+        if decoder_kd.ramp_steps > 0 and step < decoder_kd.start_step + decoder_kd.ramp_steps:
+            return decoder_kd.peak_weight * ((step - decoder_kd.start_step + 1) / decoder_kd.ramp_steps)
+
+        weight = decoder_kd.peak_weight
+        if decoder_kd.anneal_start_step is None or decoder_kd.end_step is None:
+            return weight
+        if step < decoder_kd.anneal_start_step:
+            return weight
+        if step >= decoder_kd.end_step:
+            return 0.0
+
+        remaining = decoder_kd.end_step - step
+        total = decoder_kd.end_step - decoder_kd.anneal_start_step
+        return weight * (remaining / total)
+
+    def _get_student_eval_decoder_features(self, batch: dict[str, Tensor], *, latent_mode: str) -> ACTDecoderFeatureOutput:
+        model_was_training = self.model.training
+        self.model.eval()
+        try:
+            with torch.no_grad():
+                forward_output = self.model.forward_with_features(
+                    batch,
+                    latent_mode=latent_mode,
+                    return_decoder_out=True,
+                )
+        finally:
+            self.model.train(model_was_training)
+
+        if forward_output.decoder_features is None:
+            raise RuntimeError("ACT forward_with_features(return_decoder_out=True) returned no decoder features.")
+        return forward_output.decoder_features
+
+    def _compute_decoder_kd_breakdown(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        bc_loss: Tensor,
+        action_kd_loss: Tensor | None,
+    ) -> tuple[Tensor, dict[str, float]]:
+        decoder_kd = self._get_decoder_kd_config()
+        if decoder_kd is None or not decoder_kd.enabled:
+            return bc_loss.new_zeros(()), {}
+
+        teacher_policy = self._get_teacher_policy()
+        latent_mode = decoder_kd.latent_mode
+        overlap_steps = self._get_decoder_kd_overlap_steps()
+        temporal_decay = self._get_decoder_kd_temporal_decay()
+        prefix_weight = self._get_decoder_kd_prefix_weight()
+        tail_weight = self._get_decoder_kd_tail_weight()
+
+        student_zero_output = self.model.forward_with_features(
+            batch,
+            latent_mode=latent_mode,
+            return_decoder_out=True,
+        )
+        if student_zero_output.decoder_features is None:
+            raise RuntimeError("Student zero-latent decoder feature path returned no decoder features.")
+        student_train_features = student_zero_output.decoder_features
+
+        teacher_policy.to(student_train_features.decoder_out.device)
+        teacher_features = teacher_policy.get_decoder_features(batch, latent_mode=latent_mode)
+        student_eval_features = self._get_student_eval_decoder_features(batch, latent_mode=latent_mode)
+
+        loss_breakdown: DecoderKDLossBreakdown = compute_decoder_kd_loss(
+            student_decoder_out=student_train_features.decoder_out,
+            teacher_decoder_out=teacher_features.decoder_out,
+            n_action_steps=self.config.n_action_steps,
+            action_is_pad=batch.get("action_is_pad"),
+            overlap_steps=overlap_steps,
+            temporal_decay=temporal_decay,
+            prefix_weight=prefix_weight,
+            tail_weight=tail_weight,
+            loss_type=decoder_kd.loss_type,
+            smooth_l1_beta=decoder_kd.smooth_l1_beta,
+        )
+        noise_to_signal_ratio = compute_noise_to_signal_ratio(
+            student_train_decoder_out=student_train_features.decoder_out.detach(),
+            student_eval_decoder_out=student_eval_features.decoder_out,
+            teacher_eval_decoder_out=teacher_features.decoder_out,
+            n_action_steps=self.config.n_action_steps,
+            action_is_pad=batch.get("action_is_pad"),
+            overlap_steps=overlap_steps,
+            loss_type=decoder_kd.loss_type,
+            smooth_l1_beta=decoder_kd.smooth_l1_beta,
+        )
+        ratio_breakdown: DecoderKDRatioBreakdown = compute_decoder_kd_ratios(
+            weighted_decoder_kd_loss=loss_breakdown.weighted_loss.detach(),
+            bc_loss=bc_loss.detach(),
+            action_kd_loss=action_kd_loss.detach() if action_kd_loss is not None else None,
+            prefix_loss=loss_breakdown.prefix_loss.detach(),
+            tail_loss=loss_breakdown.tail_loss.detach(),
+            noise_to_signal_ratio=noise_to_signal_ratio.detach(),
+        )
+        scheduler_weight = self._get_decoder_kd_scheduler_weight(self._get_decoder_kd_step())
+        scheduled_decoder_kd_loss = loss_breakdown.weighted_loss * scheduler_weight
+        should_compute_grad_ratios = torch.is_grad_enabled() and (
+            decoder_kd.enable_grad_gate or decoder_kd.log_grad_ratio
+        )
+        decoder_to_bc_grad_ratio = None
+        decoder_to_action_kd_grad_ratio = None
+        decoder_to_behavior_grad_ratio = None
+        if should_compute_grad_ratios:
+            (
+                decoder_to_bc_grad_ratio,
+                decoder_to_action_kd_grad_ratio,
+                decoder_to_behavior_grad_ratio,
+            ) = self._compute_decoder_kd_grad_ratios(
+                scheduled_decoder_kd_loss=scheduled_decoder_kd_loss,
+                bc_loss=bc_loss,
+                action_kd_loss=action_kd_loss,
+            )
+        gate_breakdown: DecoderKDGateBreakdown = compute_decoder_kd_gate(
+            scheduler_weight=scheduler_weight,
+            noise_to_signal_ratio=noise_to_signal_ratio.detach(),
+            decoder_to_bc_grad_ratio=decoder_to_bc_grad_ratio,
+            decoder_to_action_kd_grad_ratio=decoder_to_action_kd_grad_ratio,
+            decoder_to_behavior_grad_ratio=decoder_to_behavior_grad_ratio,
+            enable_noise_gate=decoder_kd.enable_noise_gate,
+            enable_grad_gate=decoder_kd.enable_grad_gate and should_compute_grad_ratios,
+        )
+        weighted_decoder_loss = loss_breakdown.weighted_loss * gate_breakdown.effective_weight.to(
+            device=loss_breakdown.weighted_loss.device,
+            dtype=loss_breakdown.weighted_loss.dtype,
+        )
+
+        metrics = {
+            "decoder_kd_loss": loss_breakdown.raw_loss.item(),
+            "decoder_kd_weighted_loss": loss_breakdown.weighted_loss.item(),
+            "decoder_kd_prefix_loss": loss_breakdown.prefix_loss.item(),
+            "decoder_kd_tail_loss": loss_breakdown.tail_loss.item(),
+            "decoder_kd_valid_ratio": loss_breakdown.valid_ratio.item(),
+            "decoder_kd_weighted_to_bc_ratio": ratio_breakdown.weighted_to_bc_ratio.item(),
+            "decoder_kd_weighted_to_action_kd_ratio": ratio_breakdown.weighted_to_action_kd_ratio.item(),
+            "decoder_prefix_to_tail_ratio": ratio_breakdown.prefix_to_tail_ratio.item(),
+            "noise_to_signal_ratio": ratio_breakdown.noise_to_signal_ratio.item(),
+            "decoder_kd_scheduler_weight": gate_breakdown.scheduler_weight.item(),
+            "decoder_kd_gate_multiplier": gate_breakdown.gate_multiplier.item(),
+            "decoder_kd_effective_weight": gate_breakdown.effective_weight.item(),
+            "decoder_kd_noise_gate_blocked": float(gate_breakdown.noise_gate_blocked),
+            "decoder_kd_grad_gate_blocked": float(gate_breakdown.grad_gate_blocked),
+            "decoder_kd_grad_ratio_available": float(gate_breakdown.grad_ratios_available),
+            "decoder_grad_to_bc_grad_ratio": gate_breakdown.decoder_to_bc_grad_ratio.item(),
+            "decoder_grad_to_action_kd_grad_ratio": gate_breakdown.decoder_to_action_kd_grad_ratio.item(),
+            "decoder_grad_to_behavior_grad_ratio": gate_breakdown.decoder_to_behavior_grad_ratio.item(),
+        }
+        return weighted_decoder_loss, metrics
+
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
         batch = self._prepare_batch_for_policy(batch)
@@ -311,11 +726,30 @@ class ACTPolicy(PreTrainedPolicy):
         else:
             loss = l1_loss
 
+        action_kd_loss = None
         if self.config.kd:
-            kd_loss, overlap_steps = self._compute_kd_loss(batch, actions_hat)
-            loss = loss + self.config.kd_weight * kd_loss
-            loss_dict["kd_l1_loss"] = kd_loss.item()
-            loss_dict["kd_overlap_steps"] = float(overlap_steps)
+            kd_breakdown = self._compute_kd_loss(batch, actions_hat)
+            loss = loss + self.config.kd_weight * kd_breakdown.loss
+            action_kd_loss = kd_breakdown.loss
+            loss_dict["kd_l1_loss"] = kd_breakdown.masked_mean.item()
+            loss_dict["kd_weighted_l1_loss"] = kd_breakdown.loss.item()
+            loss_dict["kd_overlap_steps"] = float(kd_breakdown.overlap_steps)
+            loss_dict["kd_valid_ratio"] = kd_breakdown.valid_ratio.item()
+            loss_dict["kd_prefix_l1_loss"] = kd_breakdown.prefix_l1_loss.item()
+            loss_dict["kd_tail_l1_loss"] = kd_breakdown.tail_l1_loss.item()
+            loss_dict["kd_to_bc_ratio"] = (kd_breakdown.loss / l1_loss.clamp_min(1e-8)).item()
+
+        decoder_kd = self._get_decoder_kd_config()
+        if decoder_kd is not None and decoder_kd.enabled:
+            decoder_loss, decoder_metrics = self._compute_decoder_kd_breakdown(
+                batch,
+                bc_loss=l1_loss,
+                action_kd_loss=action_kd_loss,
+            )
+            loss = loss + decoder_loss
+            loss_dict.update(decoder_metrics)
+            if self.training:
+                self._advance_decoder_kd_step()
 
         return loss, loss_dict
 
@@ -533,39 +967,42 @@ class ACT(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
-        """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
+    def _resolve_latent_mode(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        latent_mode: Literal["auto", "posterior", "zero"],
+    ) -> Literal["posterior", "zero"]:
+        if latent_mode == "auto":
+            if self.config.use_vae and self.training:
+                assert ACTION in batch, (
+                    "actions must be provided when using the variational objective in training mode."
+                )
+                return "posterior"
+            return "zero"
+        if latent_mode == "zero":
+            return "zero"
+        if latent_mode == "posterior":
+            if not self.config.use_vae:
+                raise ValueError("`latent_mode='posterior'` requires `use_vae=True`.")
+            if ACTION not in batch:
+                raise ValueError("`latent_mode='posterior'` requires the batch to contain ground-truth actions.")
+            if "action_is_pad" not in batch:
+                raise ValueError("`latent_mode='posterior'` requires the batch to contain `action_is_pad`.")
+            return "posterior"
+        raise ValueError(f"Unsupported latent_mode `{latent_mode}`.")
 
-        `batch` should have the following structure:
-        {
-            [robot_state_feature] (optional): (B, state_dim) batch of robot states.
-
-            [image_features]: (B, n_cameras, C, H, W) batch of images.
-                AND/OR
-            [env_state_feature]: (B, env_dim) batch of environment states.
-
-            [action_feature] (optional, only if training with VAE): (B, chunk_size, action dim) batch of actions.
-        }
-
-        Returns:
-            (B, chunk_size, action_dim) batch of action sequences
-            Tuple containing the latent PDF's parameters (mean, log(σ²)) both as (B, L) tensors where L is the
-            latent dimension.
-        """
-        if self.config.use_vae and self.training:
-            assert ACTION in batch, (
-                "actions must be provided when using the variational objective in training mode."
-            )
-
-        batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
-        batch_device = _get_batch_device(batch)
-
-        # Prepare the latent for input to the transformer encoder.
-        if self.config.use_vae and ACTION in batch and self.training:
+    def _compute_latent_sample(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        batch_size: int,
+        batch_device: torch.device,
+        latent_mode: Literal["posterior", "zero"],
+    ) -> tuple[Tensor, Tensor | None, Tensor | None]:
+        if latent_mode == "posterior":
             # Prepare the input to the VAE encoder: [cls, *joint_space_configuration, *action_sequence].
-            cls_embed = einops.repeat(
-                self.vae_encoder_cls_embed.weight, "1 d -> b 1 d", b=batch_size
-            )  # (B, 1, D)
+            cls_embed = einops.repeat(self.vae_encoder_cls_embed.weight, "1 d -> b 1 d", b=batch_size)  # (B, 1, D)
             if self.config.robot_state_feature:
                 robot_state_embed = self.vae_encoder_robot_state_input_proj(batch[OBS_STATE])
                 robot_state_embed = robot_state_embed.unsqueeze(1)  # (B, 1, D)
@@ -578,39 +1015,46 @@ class ACT(nn.Module):
             vae_encoder_input = torch.cat(vae_encoder_input, axis=1)
 
             # Prepare fixed positional embedding.
-            # Note: detach() shouldn't be necessary but leaving it the same as the original code just in case.
             pos_embed = self.vae_encoder_pos_enc.clone().detach()  # (1, S+2, D)
 
-            # Prepare key padding mask for the transformer encoder. We have 1 or 2 extra tokens at the start of the
-            # sequence depending whether we use the input states or not (cls and robot state)
-            # False means not a padding token.
             cls_joint_is_pad = torch.full(
                 (batch_size, 2 if self.config.robot_state_feature else 1),
                 False,
                 device=batch_device,
             )
-            key_padding_mask = torch.cat(
-                [cls_joint_is_pad, batch["action_is_pad"]], axis=1
-            )  # (bs, seq+1 or 2)
+            key_padding_mask = torch.cat([cls_joint_is_pad, batch["action_is_pad"]], axis=1)
 
-            # Forward pass through VAE encoder to get the latent PDF parameters.
             cls_token_out = self.vae_encoder(
                 vae_encoder_input.permute(1, 0, 2),
                 pos_embed=pos_embed.permute(1, 0, 2),
                 key_padding_mask=key_padding_mask,
-            )[0]  # select the class token, with shape (B, D)
+            )[0]
             latent_pdf_params = self.vae_encoder_latent_output_proj(cls_token_out)
             mu = latent_pdf_params[:, : self.config.latent_dim]
-            # This is 2log(sigma). Done this way to match the original implementation.
             log_sigma_x2 = latent_pdf_params[:, self.config.latent_dim :]
-
-            # Sample the latent with the reparameterization trick.
             latent_sample = mu + log_sigma_x2.div(2).exp() * torch.randn_like(mu)
-        else:
-            # When not using the VAE encoder, we set the latent to be all zeros.
-            mu = log_sigma_x2 = None
-            # TODO(rcadene, alexander-soare): remove call to `.to` to speedup forward ; precompute and use buffer
-            latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32, device=batch_device)
+            return latent_sample, mu, log_sigma_x2
+
+        mu = log_sigma_x2 = None
+        latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32, device=batch_device)
+        return latent_sample, mu, log_sigma_x2
+
+    def _forward_impl(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        latent_mode: Literal["auto", "posterior", "zero"] = "auto",
+        return_decoder_out: bool = False,
+    ) -> ACTForwardWithFeaturesOutput:
+        resolved_latent_mode = self._resolve_latent_mode(batch, latent_mode=latent_mode)
+        batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
+        batch_device = _get_batch_device(batch)
+        latent_sample, mu, log_sigma_x2 = self._compute_latent_sample(
+            batch,
+            batch_size=batch_size,
+            batch_device=batch_device,
+            latent_mode=resolved_latent_mode,
+        )
 
         # Prepare transformer encoder inputs.
         encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
@@ -663,8 +1107,55 @@ class ACT(nn.Module):
         decoder_out = decoder_out.transpose(0, 1)
 
         actions = self.action_head(decoder_out)
+        decoder_features = None
+        if return_decoder_out:
+            decoder_features = ACTDecoderFeatureOutput(
+                decoder_out=decoder_out,
+                latent_mode=resolved_latent_mode,
+                chunk_size=self.config.chunk_size,
+                feature_dim=self.config.dim_model,
+            )
+        return ACTForwardWithFeaturesOutput(
+            actions=actions,
+            mu=mu,
+            log_sigma_x2=log_sigma_x2,
+            decoder_features=decoder_features,
+        )
 
-        return actions, (mu, log_sigma_x2)
+    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
+        """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
+
+        `batch` should have the following structure:
+        {
+            [robot_state_feature] (optional): (B, state_dim) batch of robot states.
+
+            [image_features]: (B, n_cameras, C, H, W) batch of images.
+                AND/OR
+            [env_state_feature]: (B, env_dim) batch of environment states.
+
+            [action_feature] (optional, only if training with VAE): (B, chunk_size, action dim) batch of actions.
+        }
+
+        Returns:
+            (B, chunk_size, action_dim) batch of action sequences
+            Tuple containing the latent PDF's parameters (mean, log(σ²)) both as (B, L) tensors where L is the
+            latent dimension.
+        """
+        forward_output = self._forward_impl(batch, latent_mode="auto", return_decoder_out=False)
+        return forward_output.actions, (forward_output.mu, forward_output.log_sigma_x2)
+
+    def forward_with_features(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        latent_mode: Literal["auto", "posterior", "zero"] = "auto",
+        return_decoder_out: bool = False,
+    ) -> ACTForwardWithFeaturesOutput:
+        return self._forward_impl(
+            batch,
+            latent_mode=latent_mode,
+            return_decoder_out=return_decoder_out,
+        )
 
 
 class ACTEncoder(nn.Module):

@@ -95,6 +95,33 @@ Notes:
 - Distillation only supervises the overlapping action prefix between teacher and student, so you can safely train a shorter-horizon student from a longer-horizon teacher.
 - Teacher and student must agree on observation keys, input shapes, and action dimensions.
 
+Phase-1 support boundary:
+
+- Only ACT-to-ACT distillation is supported.
+- Teacher and student must share the same observation schema and action dimensionality.
+- Phase 1 only supports reusing the student batch in the same normalized action space.
+- The teacher snapshot is pinned during startup and written to run-level metadata at `output_dir/kd_teacher_metadata.json`.
+- The run-level metadata uses the training metadata schema, including root keys such as `comparison_space`, `processor_compatibility`, and `metric_aggregation_mode`, plus nested teacher provenance under `teacher.original_path`, `teacher.pinned_pretrained_path`, `teacher.source_kind`, and `teacher.checkpoint_step`.
+
+Phase-1 fail-fast behavior:
+
+- Training resolves, loads, and attaches the ACT teacher bundle during startup instead of waiting for the first forward pass.
+- Teacher and student preprocessors must pass the ACT processor compatibility check before the bundle is attached.
+- Teacher and student must use the same rename behavior, normalization mapping, normalized observation keys, normalization stats, and image-key order.
+- If any of those checks fail, training aborts before the first optimization step rather than silently comparing mismatched tensors.
+
+Logging behavior:
+
+- KD metrics are emitted through the normal training tracker, including `kd_l1_loss`, `kd_weighted_l1_loss`, `kd_overlap_steps`, and the model-side `kd_to_bc_ratio`.
+- In ACT, `kd_to_bc_ratio` refers to the weighted KD loss divided by the BC loss. If an older output dict lacks that model-side ratio, the trainer backfills `kd_weighted_to_bc_ratio` instead of reusing the `kd_to_bc_ratio` name.
+- Under multi-process training, KD metrics are reduced across ranks before they are logged, so the tracker and WandB see global values instead of rank-0-only values.
+
+Explicit non-goals for phase 1:
+
+- No cross-policy distillation.
+- No hidden-state or latent distillation.
+- No automatic canonicalization path for teacher/student processors that do not already match.
+
 ### Train using Google Colab
 
 If your local computer doesn't have a powerful GPU, you can utilize Google Colab to train your model by following the [ACT training notebook](./notebooks#training-act).

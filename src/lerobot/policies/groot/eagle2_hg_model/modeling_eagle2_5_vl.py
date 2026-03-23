@@ -26,6 +26,16 @@ from .configuration_eagle2_5_vl import Eagle25VLConfig
 logger = logging.get_logger(__name__)
 
 
+def _resolve_attn_implementation() -> str:
+    try:
+        import flash_attn  # noqa: F401
+
+        return "flash_attention_2"
+    except ImportError:
+        logger.warning("flash_attn is not installed; falling back to eager attention for Eagle25VL.")
+        return "eager"
+
+
 # copy from https://github.com/huggingface/transformers/blob/main/src/transformers/models/llava_onevision/modeling_llava_onevision.py#L241C1-L280C1
 EAGLE2_5_VL_START_DOCSTRING = r"""
     This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
@@ -83,6 +93,10 @@ class Eagle25VLForConditionalGeneration(Eagle25VLPreTrainedModel, GenerationMixi
 
     def __init__(self, config: Eagle25VLConfig, vision_model=None, language_model=None):
         super().__init__(config)
+        attn_implementation = _resolve_attn_implementation()
+        config._attn_implementation = attn_implementation
+        config.vision_config._attn_implementation = attn_implementation
+        config.text_config._attn_implementation = attn_implementation
 
         image_size = config.force_image_size or config.vision_config.image_size
         patch_size = config.vision_config.patch_size
@@ -104,7 +118,6 @@ class Eagle25VLForConditionalGeneration(Eagle25VLPreTrainedModel, GenerationMixi
             self.vision_model = vision_model
         else:
             if config.vision_config.model_type == "siglip_vision_model":
-                config.vision_config._attn_implementation = "flash_attention_2"
                 self.vision_model = SiglipVisionModel(config.vision_config)
             else:
                 raise NotImplementedError(f"{config.vision_config.model_type} is not implemented.")
@@ -118,9 +131,6 @@ class Eagle25VLForConditionalGeneration(Eagle25VLPreTrainedModel, GenerationMixi
                 raise NotImplementedError("Phi3 is not implemented.")
                 # self.language_model = Phi3ForCausalLM(config.text_config)
             elif config.text_config.architectures[0] == "Qwen2ForCausalLM":
-                assert config.text_config._attn_implementation == "flash_attention_2", (
-                    f"Qwen2 must use flash_attention_2 but got {config.text_config._attn_implementation}"
-                )
                 self.language_model = Qwen2ForCausalLM(config.text_config)
             elif config.text_config.architectures[0] == "Qwen3ForCausalLM":
                 self.language_model = Qwen3ForCausalLM(config.text_config)
