@@ -147,22 +147,23 @@ class SO101Follower(Robot):
         print("Calibration saved to", self.calibration_fpath)
 
     def configure(self) -> None:
-        with self.bus.torque_disabled():
-            self.bus.configure_motors()
+        config_retry = 5
+        with self.bus.torque_disabled(num_retry=config_retry):
+            self.bus.configure_motors(num_retry=config_retry)
             for motor in self.bus.motors:
-                self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
+                self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value, num_retry=config_retry)
                 # Set P_Coefficient to lower value to avoid shakiness (Default is 32)
-                self.bus.write("P_Coefficient", motor, 16)
+                self.bus.write("P_Coefficient", motor, 16, num_retry=config_retry)
                 # Set I_Coefficient and D_Coefficient to default value 0 and 32
-                self.bus.write("I_Coefficient", motor, 0)
-                self.bus.write("D_Coefficient", motor, 32)
+                self.bus.write("I_Coefficient", motor, 0, num_retry=config_retry)
+                self.bus.write("D_Coefficient", motor, 32, num_retry=config_retry)
 
                 if motor == "gripper":
                     self.bus.write(
-                        "Max_Torque_Limit", motor, 500
+                        "Max_Torque_Limit", motor, 500, num_retry=config_retry
                     )  # 50% of the max torque limit to avoid burnout
-                    self.bus.write("Protection_Current", motor, 250)  # 50% of max current to avoid burnout
-                    self.bus.write("Overload_Torque", motor, 25)  # 25% torque when overloaded
+                    self.bus.write("Protection_Current", motor, 250, num_retry=config_retry)  # 50% of max current to avoid burnout
+                    self.bus.write("Overload_Torque", motor, 25, num_retry=config_retry)  # 25% torque when overloaded
 
     def setup_motors(self) -> None:
         for motor in reversed(self.bus.motors):

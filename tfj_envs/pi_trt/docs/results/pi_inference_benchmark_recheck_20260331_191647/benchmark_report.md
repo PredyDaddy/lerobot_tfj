@@ -1,0 +1,83 @@
+# PI0.5 推理时延 Benchmark
+
+## 1. 测试对象
+
+- policy_path: `/data/tfj/lerobot_tfj/pi_model/pretrained_model`
+- onnx_path: `/data/tfj/lerobot_tfj/tfj_envs/pi_trt/docs/results/pi_model_consistency_20260313_182839/artifacts/onnx`
+- trt_path: `/data/tfj/lerobot_tfj/tfj_envs/pi_trt/docs/results/pi_model_consistency_20260313_182839/artifacts/engines`
+- measured_at_utc: `2026-03-31T11:20:28.357977+00:00`
+
+## 2. 测试设置
+
+- warmup_iterations: `10`
+- measured_iterations: `30`
+- num_inference_steps: `10`
+- n_action_steps: `50`
+- chunk_size: `50`
+- torch_device: `cuda:0`
+- torch_use_amp: `False`
+- torch_amp_mode: `None`
+- onnx_provider: `cuda`
+- trt_device: `cuda:0`
+
+## 3. TRT Provenance
+
+- variant: `pi05`
+- requested_precision: `fp32`
+- metadata_path: `/data/tfj/lerobot_tfj/tfj_envs/pi_trt/docs/results/pi_model_consistency_20260313_182839/pi_trt_metadata.json`
+- checkpoint_dir: `/data/tfj/lerobot_tfj/pi_model/pretrained_model`
+- stage4_report_path: `/data/tfj/lerobot_tfj/tfj_envs/pi_trt/docs/results/pi_model_consistency_20260313_182839/stage4_build_engines.json`
+- stage4_report_status: `pass`
+- stage5_report_path: `/data/tfj/lerobot_tfj/tfj_envs/pi_trt/docs/results/pi_model_consistency_20260313_182839/stage5_verify_trt.json`
+- stage5_report_status: `pass`
+- allow_unsafe_trt_artifacts: `False`
+
+## 4. 环境
+
+- git_commit: `3ad38e91128cd1bbe0e8925acdefb19f1a7f2d21`
+- python: `3.10.19`
+- torch: `2.7.1+cu126`
+- onnxruntime: `1.23.2`
+- tensorrt: `10.13.0.35`
+- gpu: `NVIDIA GeForce RTX 4090, 570.133.20, 49140 MiB`
+
+## 5. 结果总表
+
+| Backend | Stage | mean_ms | p50_ms | p95_ms | min_ms | max_ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| pytorch | vision_encoder_single | 4.115 | 4.111 | 4.151 | 4.075 | 4.248 |
+| pytorch | vision_encoder_pair | 8.134 | 8.119 | 8.240 | 8.066 | 8.247 |
+| pytorch | prefix_cache | 25.147 | 24.972 | 25.689 | 24.874 | 25.727 |
+| pytorch | denoise_step | 6.300 | 6.276 | 6.539 | 6.169 | 6.744 |
+| pytorch | pipeline_staged | 94.731 | 94.800 | 95.547 | 92.917 | 95.707 |
+| pytorch | pipeline_chunk | 93.971 | 94.335 | 94.993 | 91.576 | 95.077 |
+| onnx | vision_encoder_single | 7.630 | 7.624 | 7.667 | 7.602 | 7.683 |
+| onnx | vision_encoder_pair | 15.630 | 15.614 | 15.746 | 15.555 | 15.881 |
+| onnx | prefix_cache | 63.168 | 63.175 | 63.275 | 62.977 | 63.316 |
+| onnx | denoise_step | 7.443 | 7.438 | 7.554 | 7.270 | 7.574 |
+| onnx | pipeline_chunk | 155.415 | 155.326 | 156.570 | 154.552 | 157.625 |
+| tensorrt | vision_encoder_single | 6.392 | 6.378 | 6.497 | 6.343 | 6.569 |
+| tensorrt | vision_encoder_pair | 12.778 | 12.777 | 12.844 | 12.694 | 12.881 |
+| tensorrt | prefix_cache | 63.147 | 63.130 | 63.332 | 62.929 | 63.672 |
+| tensorrt | denoise_step | 4.620 | 4.581 | 4.923 | 4.534 | 4.981 |
+| tensorrt | pipeline_chunk | 122.893 | 122.755 | 126.917 | 118.280 | 130.125 |
+
+## 6. Chunk 推理的实际意义
+
+- pytorch: chunk_mean=93.971 ms, amortized_per_action_step=1.879 ms, estimated_denoise_loop_total=62.997 ms
+- onnx: chunk_mean=155.415 ms, amortized_per_action_step=3.108 ms, estimated_denoise_loop_total=74.431 ms
+- tensorrt: chunk_mean=122.893 ms, amortized_per_action_step=2.458 ms, estimated_denoise_loop_total=46.204 ms
+
+## 7. 说明
+
+- 这是离线纯推理 benchmark，不等价于机器人闭环控制 latency。
+- 这次只测模型推理链，不包含相机采集、MJPG 解码、robot observation、send_action、安全限幅、sleep 控频。
+- 输入是 `build_runtime_context()` 生成的 deterministic baseline batch，适合做固定口径对比，不代表真实任务数据分布。
+- 当 `torch_use_amp=true` 时，这里的 `PyTorch AMP` 明确表示 `CUDA BF16 autocast`，不是 `Torch FP16`。
+- `vision_encoder_single` 表示单相机一次调用；`vision_encoder_pair` 表示 top+wrist 两次调用总和。
+- `denoise_step` 是单次 denoise 迭代，不是完整 chunk；`pipeline_chunk` 才是完整一次 action chunk 生成。
+- `amortized_per_action_step_ms = pipeline_chunk / n_action_steps`，这是均摊值，不是每个 control loop 的最坏时延。
+- ONNX Runtime 结果反映的是当前工程实现路径，runner 使用常规 `session.run(...)` 和 `numpy <-> torch` 边界，不是纯 GPU kernel benchmark。
+- PyTorch 子图拆分时延来自 export wrapper 路径，用来和 ONNX/TRT 子图做对应比较。
+- PyTorch 的 `pipeline_chunk` 额外给了真实 `policy.predict_action_chunk(...)` 路径，不是 wrapper 拼接模拟。
+- TensorRT 结论只对当前已验证通过的 static-shape、batch=1、固定 token length engine 成立。

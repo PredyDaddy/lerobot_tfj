@@ -34,6 +34,7 @@ from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
+from lerobot.policies.pi06.configuration_pi06 import PI06Config
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
@@ -193,6 +194,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 
         return PI05Policy
+    elif name == "pi06":
+        from lerobot.policies.pi06.modeling_pi06 import PI06Policy
+
+        return PI06Policy
     elif name == "sac":
         from lerobot.policies.sac.modeling_sac import SACPolicy
 
@@ -244,6 +249,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return PI0Config(**kwargs)
     elif policy_type == "pi05":
         return PI05Config(**kwargs)
+    elif policy_type == "pi06":
+        return PI06Config(**kwargs)
     elif policy_type == "sac":
         return SACConfig(**kwargs)
     elif policy_type == "smolvla":
@@ -404,6 +411,14 @@ def make_pre_post_processors(
         from lerobot.policies.pi0.processor_pi0 import make_pi0_pre_post_processors
 
         processors = make_pi0_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, PI06Config):
+        from lerobot.policies.pi06.processor_pi06 import make_pi06_pre_post_processors
+
+        processors = make_pi06_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

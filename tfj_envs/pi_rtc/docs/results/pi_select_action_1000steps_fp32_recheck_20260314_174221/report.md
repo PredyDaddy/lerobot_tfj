@@ -1,0 +1,34 @@
+# PI0.5 1000-step Pure Inference Compare
+
+- measured_at_utc: `2026-03-14T09:44:41.144838+00:00`
+- policy_path: `/data/tfj/lerobot_tfj/pi_model/pretrained_model`
+- steps: `1000`
+- warmup_steps: `100`
+- n_action_steps: `50`
+- expected_chunk_refreshes: `20`
+- num_inference_steps: `10`
+
+## 1. TRT Provenance
+
+- variant: `pi05`
+- requested_precision: `fp32`
+- metadata_path: `/data/tfj/lerobot_tfj/tfj_envs/pi_trt/docs/results/pi_model_consistency_20260313_182839/pi_trt_metadata.json`
+- stage4_report_path: `/data/tfj/lerobot_tfj/tfj_envs/pi_trt/docs/results/pi_model_consistency_20260313_182839/stage4_build_engines.json`
+- stage5_report_path: `/data/tfj/lerobot_tfj/tfj_envs/pi_trt/docs/results/pi_model_consistency_20260313_182839/stage5_verify_trt.json`
+- allow_unsafe_trt_artifacts: `False`
+
+## 2. Results
+
+| Backend | total_time_ms | mean_per_step_ms | steps_per_s |
+| --- | ---: | ---: | ---: |
+| pytorch_fp32 | 2894.332 | 2.894 | 345.503 |
+| pytorch_amp_bf16 | 2971.220 | 2.971 | 336.562 |
+| onnx_cuda_runtime | 3143.981 | 3.144 | 318.068 |
+| tensorrt_fp32 | 2490.646 | 2.491 | 401.502 |
+
+## 3. Notes
+
+- 这是纯 `select_action()` 推理 benchmark，不接机器人、不读串口、不下发动作。
+- 计时包含 chunk queue 的刷新与复用，因此反映的是均摊后的纯推理吞吐，而不是单次 chunk 刷新时延。
+- `PyTorch AMP` 在本报告中明确表示 `CUDA BF16 autocast`，不是 `Torch FP16`。
+- TensorRT 结果只对当前已验证通过的 static-shape、batch=1、固定 token length 工件成立。

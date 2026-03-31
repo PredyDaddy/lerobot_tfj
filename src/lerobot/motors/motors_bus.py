@@ -542,7 +542,7 @@ class MotorsBus(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def configure_motors(self) -> None:
+    def configure_motors(self, *, num_retry: int = 0) -> None:
         """Write implementation-specific recommended settings to every motor.
 
         Typical changes include shortening the return delay, increasing
@@ -580,7 +580,7 @@ class MotorsBus(abc.ABC):
         pass
 
     @contextmanager
-    def torque_disabled(self, motors: int | str | list[str] | None = None):
+    def torque_disabled(self, motors: int | str | list[str] | None = None, *, num_retry: int = 0):
         """Context-manager that guarantees torque is re-enabled.
 
         This helper is useful to temporarily disable torque when configuring motors.
@@ -590,11 +590,11 @@ class MotorsBus(abc.ABC):
             ...     # Safe operations here
             ...     pass
         """
-        self.disable_torque(motors)
+        self.disable_torque(motors, num_retry=num_retry)
         try:
             yield
         finally:
-            self.enable_torque(motors)
+            self.enable_torque(motors, num_retry=num_retry)
 
     def set_timeout(self, timeout_ms: int | None = None):
         """Change the packet timeout used by the SDK.
