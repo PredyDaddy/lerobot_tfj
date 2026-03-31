@@ -1,0 +1,38 @@
+{
+  "id": "openclaw-groot-tool",
+  "name": "GROOT Robot Tool",
+  "description": "Expose local GROOT robot execution over OpenClaw agent tools.",
+  "version": "0.1.0",
+  "skills": ["skills/groot-http"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "baseUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:8765"
+      },
+      "requestTimeoutMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "default": 10000
+      },
+      "defaultDisplayData": {
+        "type": "boolean",
+        "default": true
+      }
+    }
+  },
+  "uiHints": {
+    "baseUrl": {
+      "label": "GROOT Server URL",
+      "placeholder": "http://127.0.0.1:8765"
+    },
+    "requestTimeoutMs": {
+      "label": "HTTP Timeout (ms)"
+    },
+    "defaultDisplayData": {
+      "label": "Display Camera UI"
+    }
+  }
+}

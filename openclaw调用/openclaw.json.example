@@ -1,0 +1,25 @@
+// ~/.openclaw/openclaw.json
+{
+  plugins: {
+    entries: {
+      "openclaw-groot-tool": {
+        enabled: true,
+        config: {
+          baseUrl: "http://127.0.0.1:8765",
+          requestTimeoutMs: 10000,
+          defaultDisplayData: true,
+        },
+      },
+    },
+  },
+  agents: {
+    list: [
+      {
+        id: "main",
+        tools: {
+          alsoAllow: ["groot_run", "groot_job_status", "groot_job_stop"],
+        },
+      },
+    ],
+  },
+}

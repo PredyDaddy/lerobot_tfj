@@ -1,0 +1,9 @@
+{
+  "name": "openclaw-groot-tool",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "openclaw": {
+    "extensions": ["./groot-tool.mjs"]
+  }
+}
